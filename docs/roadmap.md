@@ -17,20 +17,20 @@ The heavier mathematical components (Riemannian metric tensor, GP compliance est
 
 ```
 ┌──────────────────────────┐                ┌──────────────────────────────┐
-│      DEV LAPTOP          │                │     GPU LAPTOP (5070, 12GB)  │
-│                          │                │                              │
-│  Probe library           │                │   llama.cpp llama-server     │
-│  Scorer (Stage 1 LLM-J)  │  HTTP / OpenAI │   GGUF quantized model       │
-│  CUSUM / EWMA monitor    │ ─────────────► │   :8080  /v1/chat/completions │
+│      DEV LAPTOP          │                │  GPU LAPTOP (5070, 12 GB)    │
+│                          │                │  ─ Ubuntu host running VM ─  │
+│  Probe library           │                │                              │
+│  Scorer (Stage 1 LLM-J)  │  HTTP / OpenAI │  Ollama (in VM)              │
+│  CUSUM / EWMA monitor    │ ─────────────► │  192.168.1.30:11434/v1       │
 │  Fragility analyzer      │                │                              │
-│  Feedback synthesizer    │                │  (no framework code here)    │
-│  SQLite store            │                │                              │
-│  Streamlit dashboard     │                │                              │
-└──────────┬───────────────┘                └──────────────────────────────┘
-           │
-           │  same OpenAI-compatible interface
-           ▼
-   Anthropic API / OpenAI API   (external-API mode)
+│  Feedback synthesizer    │                │  Models served:              │
+│  SQLite store            │                │   - llama3.1:8b-instruct     │
+│  Streamlit dashboard     │                │     (supervised system)      │
+│                          │                │   - medgemma1.5:4b-it        │
+│                          │                │     (judge)                  │
+└──────────────────────────┘                └──────────────────────────────┘
+
+v1 is fully-local: no external-API path.
 ```
 
 ---
@@ -40,8 +40,8 @@ The heavier mathematical components (Riemannian metric tensor, GP compliance est
 | Concern | Choice | Rationale |
 |---|---|---|
 | Language / runtime | Python 3.11, `uv` | Standard for ML; `uv` is fast and reproducible |
-| LLM serving (GPU laptop) | **llama.cpp `llama-server`** w/ GGUF; Ollama as fallback | Best memory control at 12 GB; OpenAI-compatible out of the box. vLLM has heavier KV-cache overhead that bites at 12 GB |
-| LLM client (dev laptop) | `openai` Python SDK with `base_url` override | Same code paths for local llama.cpp, OpenAI, OpenRouter; Anthropic wrapped with a thin adapter |
+| LLM serving (GPU laptop) | **Ollama** with GGUF models, exposed via OpenAI-compatible `/v1` endpoint | Simple model management (`ollama pull`/`run`), automatic VRAM swapping, OpenAI-compatible out of the box. Runs inside a Virtual Machine hosted on the Ubuntu OS of the GPU laptop, reachable at `http://192.168.1.30:11434` |
+| LLM client (dev laptop) | `openai` Python SDK with `base_url` override pointing at Ollama | Single OpenAI-compatible code path; the same client talks to whichever model Ollama has loaded. No external-API backends in v1 |
 | Storage | SQLite + SQLAlchemy 2.0 | Single-file, no server, sufficient for thousands of probes |
 | Schema migrations | Alembic | Cheap to add early, painful to retrofit |
 | Stats | NumPy + SciPy | CUSUM/EWMA are a few lines |
@@ -54,11 +54,10 @@ The heavier mathematical components (Riemannian metric tensor, GP compliance est
 | Role | Model | Notes |
 |---|---|---|
 | Supervised system (black box under test) | Llama-3.1-8B-Instruct Q4_K_M (~5 GB) | Small, well-known, easy to nudge with system prompts |
-| Judge — hybrid mode (recommended default) | Anthropic Claude Haiku (iteration), Sonnet (calibration runs) | Better calibration, no GPU contention; the default for v1 |
-| Judge — fully-local mode (feasibility test) | Qwen2.5-14B-Instruct Q4_K_S (~8 GB) | Fits if loaded *instead of* the supervised model; two-pass workflow |
+| Judge — hybrid mode (recommended default) | medgemma1.5:4b-it-q4_K_M | Better calibration |
 | Embedding model (v2) | `emilyalsentzer/Bio_ClinicalBERT` on CPU | Deferred until Stage-2 classifier work begins |
 
-Hybrid mode (external-API judge + local supervised system) is the recommended default. Fully-local mode is a secondary configuration exercised as a feasibility checkpoint after v1 is stable.
+Fully-local mode is the recommended configuration. It is accesible via ollama served at http://192.168.1.30
 
 ---
 
