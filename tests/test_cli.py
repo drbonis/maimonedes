@@ -55,8 +55,8 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
 @pytest.fixture
 def fake_backend(monkeypatch: pytest.MonkeyPatch) -> FakeLLMClient:
     fake = FakeLLMClient(default_content="PONG")
-    monkeypatch.setenv("SUPERVISED_MODEL", "supervised:test")
-    monkeypatch.setenv("JUDGE_MODEL", "judge:test")
+    monkeypatch.setenv("OLLAMA_SUPERVISED_MODEL", "supervised:test")
+    monkeypatch.setenv("OLLAMA_JUDGE_MODEL", "judge:test")
     cli.set_backend_factory(lambda settings: fake)
     yield fake
     cli.reset_backend_factory()

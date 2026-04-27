@@ -38,7 +38,8 @@ def _default_backend_factory(settings: Settings) -> object:
     return OllamaBackend(
         base_url=settings.ollama_base_url,
         api_key=settings.ollama_api_key,
-        timeout_s=settings.ollama_timeout_s,
+        request_timeout_s=settings.ollama_request_timeout_s,
+        max_retries=settings.ollama_max_retries,
     )
 
 
@@ -75,7 +76,7 @@ def _ping_one(model: str, settings: Settings) -> None:
 
 def _models_to_ping(model: str | None, all_models: bool, settings: Settings) -> Iterable[str]:
     if all_models:
-        return [settings.supervised_model, settings.judge_model]
+        return [settings.ollama_supervised_model, settings.ollama_judge_model]
     if model is None:
         raise typer.BadParameter("Provide --model <tag> or --all.")
     return [model]
