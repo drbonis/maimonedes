@@ -1,0 +1,50 @@
+[project]
+name = "maimonedes"
+version = "0.1.0"
+description = "Black-box behavioral supervision framework for clinical-decision LLMs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Julio Bonis" }]
+
+dependencies = [
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+]
+
+[project.scripts]
+maimonedes = "maimonedes.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/maimonedes"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+    "mypy>=1.9",
+    "ruff>=0.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: marks tests that require live external services (Ollama, etc.); deselected by default",
+]
+addopts = "-m 'not integration'"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+warn_unused_ignores = true

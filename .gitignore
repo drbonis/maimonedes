@@ -1,0 +1,36 @@
+# Python build artefacts
+build/
+dist/
+*.egg-info/
+*.egg
+*.pyc
+*.pyo
+__pycache__/
+
+# Virtual envs
+.venv/
+venv/
+
+# Caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local databases
+*.sqlite
+*.sqlite-journal
+*.sqlite3
+*.db
+
+# Secrets / local config
+.env
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local agent state
+.claude/
