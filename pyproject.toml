@@ -10,6 +10,8 @@ authors = [{ name = "Julio Bonis" }]
 dependencies = [
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
 ]
 
 [project.scripts]
