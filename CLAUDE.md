@@ -30,3 +30,13 @@ attempts when uv installs site-packages.
 
 Set them once per shell (or export in your shell profile) and every
 subsequent `uv run …` / `uv sync` will use the same venv.
+
+For convenience, the repo ships a small helper:
+
+```bash
+source scripts/dev_env.sh
+uv run alembic upgrade head
+uv run pytest
+```
+
+Sourcing is idempotent — safe to add to `~/.bashrc`'s repo cd hook.
