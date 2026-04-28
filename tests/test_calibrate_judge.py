@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import csv
-import json
 import os
 from pathlib import Path
 
@@ -20,7 +19,7 @@ from maimonedes.experiments.calibrate_judge import (
 )
 from maimonedes.llm.client import ChatResponse
 from maimonedes.settings import get_settings
-from tests.fakes import FakeLLMClient
+from tests.fakes import FakeLLMClient, payload_json_for_target
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = PROJECT_ROOT / "config" / "policies" / "scope_of_practice.yaml"
@@ -39,22 +38,12 @@ def policy() -> Policy:
 def _judge_payload(policy: Policy, target: float) -> str:
     """Return a JSON payload whose aggregate, after weighting, is `target`.
 
-    Trick: set every sub-condition's normalised value to `target` directly.
-      - boolean → `target >= 0.5` flips to true (1.0); else false (0.0).
-      - 0-3 → round target * 3 to the nearest int 0..3, then judge_payload
-        maps that back to val/3.0.
-
-    For coarse targets in {0, 1/3, 2/3, 1} the math is exact; for
-    intermediate values it's the closest representable score on the
-    given scale.
+    Each sub-condition's normalised value is set as close to `target`
+    as the scale's discretisation allows. For coarse targets that
+    align with the scale's representable values the aggregate is
+    exact; for intermediate targets it's the nearest neighbour.
     """
-    scores: dict[str, bool | int] = {}
-    for s in policy.rubric.sub_conditions:
-        if s.scale == "boolean":
-            scores[s.id] = target >= 0.5
-        else:
-            scores[s.id] = round(max(0.0, min(1.0, target)) * 3)
-    return json.dumps({"scores": scores})
+    return payload_json_for_target(policy, target)
 
 
 # ---- reference loader ------------------------------------------------------

@@ -28,16 +28,29 @@ def _normalise(s: SubCondition, raw: Any) -> float:
                 f"sub-condition {s.id!r}: expected boolean, got {type(raw).__name__}"
             )
         return 1.0 if raw else 0.0
-    # 0-3 scale
-    if isinstance(raw, bool) or not isinstance(raw, int):
+    if s.scale == "0-3":
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise LLMResponseError(
+                f"sub-condition {s.id!r}: expected integer 0..3, got {type(raw).__name__}"
+            )
+        if not 0 <= raw <= 3:
+            raise LLMResponseError(
+                f"sub-condition {s.id!r}: integer out of [0,3], got {raw}"
+            )
+        return raw / 3.0
+    # labels scale (BARS): raw must be one of the declared label ids.
+    if not isinstance(raw, str):
         raise LLMResponseError(
-            f"sub-condition {s.id!r}: expected integer 0..3, got {type(raw).__name__}"
+            f"sub-condition {s.id!r}: expected one of "
+            f"{s.label_ids()}, got {type(raw).__name__}"
         )
-    if not 0 <= raw <= 3:
+    try:
+        return s.value_for_label(raw)
+    except KeyError as exc:
         raise LLMResponseError(
-            f"sub-condition {s.id!r}: integer out of [0,3], got {raw}"
-        )
-    return raw / 3.0
+            f"sub-condition {s.id!r}: unknown label {raw!r}; "
+            f"expected one of {s.label_ids()}"
+        ) from exc
 
 
 def _parse_judge_payload(policy: Policy, content: str) -> dict[str, float]:

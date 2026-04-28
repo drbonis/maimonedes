@@ -3,12 +3,16 @@
 Policies (clinical scope, epistemic calibration, demographic invariance,
 ...) are versioned YAML files; each one declares prose policy text plus
 a rubric of 5–7 sub-conditions the judge scores. Phase 1 wires up the
-scope-of-practice policy. The §5.2 rubric in
-`docs/blackbox_supervision_architecture.md` is the seed.
+scope-of-practice policy.
 
 Sub-condition scales:
-- "boolean": judge emits true/false → 1.0 / 0.0 in code
-- "0-3": judge emits int 0..3 → val / 3.0 in code
+- "boolean": judge emits true/false  → 1.0 / 0.0
+- "0-3":     judge emits int 0..3    → val / 3.0
+- "labels":  judge picks one label_id → label.value (BARS edition; the
+            label set is sub-condition-specific and each label carries
+            a behavior-anchored description plus a normalised value
+            in [0, 1]). See `docs/blackbox_supervision_architecture.md`
+            §5.2 for context.
 """
 from __future__ import annotations
 
@@ -19,8 +23,23 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-Scale = Literal["boolean", "0-3"]
+Scale = Literal["boolean", "0-3", "labels"]
 WEIGHT_SUM_TOLERANCE = 1e-6
+
+
+class Label(BaseModel):
+    """One BARS rating step for a labels-scale sub-condition.
+
+    `value` is the normalised score the framework records when the
+    judge picks this label; `description` is the behavior anchor the
+    judge sees in the prompt.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = Field(min_length=1)
+    value: float = Field(ge=0.0, le=1.0)
+    description: str = Field(min_length=1)
 
 
 class SubCondition(BaseModel):
@@ -30,6 +49,51 @@ class SubCondition(BaseModel):
     description: str = Field(min_length=1)
     scale: Scale
     weight: float = Field(ge=0.0, le=1.0)
+    # Required when `scale == "labels"`; must be omitted otherwise.
+    labels: list[Label] | None = None
+
+    @model_validator(mode="after")
+    def _check_scale_consistency(self) -> "SubCondition":
+        if self.scale == "labels":
+            if not self.labels or len(self.labels) < 2:
+                raise ValueError(
+                    f"sub-condition {self.id!r}: scale='labels' requires at "
+                    f"least 2 labels"
+                )
+            ids = [label.id for label in self.labels]
+            if len(set(ids)) != len(ids):
+                duplicates = sorted({i for i in ids if ids.count(i) > 1})
+                raise ValueError(
+                    f"sub-condition {self.id!r}: duplicate label ids: {duplicates}"
+                )
+        elif self.labels is not None:
+            raise ValueError(
+                f"sub-condition {self.id!r}: `labels` field is only valid "
+                f"when scale='labels'"
+            )
+        return self
+
+    def label_ids(self) -> list[str]:
+        """Return the list of label ids in YAML order. Labels-scale only."""
+        if self.labels is None:
+            raise ValueError(
+                f"sub-condition {self.id!r}: scale={self.scale!r} has no labels"
+            )
+        return [label.id for label in self.labels]
+
+    def value_for_label(self, label_id: str) -> float:
+        """Return the normalised value for `label_id`. Labels-scale only.
+
+        Raises `KeyError` if `label_id` isn't part of this sub-condition.
+        """
+        if self.labels is None:
+            raise ValueError(
+                f"sub-condition {self.id!r}: scale={self.scale!r} has no labels"
+            )
+        for label in self.labels:
+            if label.id == label_id:
+                return label.value
+        raise KeyError(label_id)
 
 
 class Rubric(BaseModel):
@@ -92,4 +156,11 @@ def _load_yaml(path: str | Path) -> dict[str, Any]:
     return parsed
 
 
-__all__ = ["Policy", "Rubric", "Scale", "SubCondition", "load_policy"]
+__all__ = [
+    "Label",
+    "Policy",
+    "Rubric",
+    "Scale",
+    "SubCondition",
+    "load_policy",
+]

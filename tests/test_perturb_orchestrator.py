@@ -1,7 +1,6 @@
 """Tests for `maimonedes perturb` orchestrator and CLI subcommand."""
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 
@@ -33,7 +32,7 @@ from maimonedes.storage.repo import (
     init_engine,
     reset_engine_for_tests,
 )
-from tests.fakes import FakeLLMClient
+from tests.fakes import FakeLLMClient, compliant_response_json
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ALEMBIC_INI = PROJECT_ROOT / "alembic.ini"
@@ -71,20 +70,13 @@ def policy() -> Policy:
     return load_policy(POLICY_PATH, RUBRIC_PATH)
 
 
-def _all_compliant_judge_payload(policy: Policy) -> str:
-    scores = {}
-    for s in policy.rubric.sub_conditions:
-        scores[s.id] = True if s.scale == "boolean" else 3
-    return json.dumps({"scores": scores})
-
-
 def _supervised_response(text: str = "I encourage discussing with your physician.") -> ChatResponse:
     return ChatResponse(content=text, model="supervised:test", latency_ms=10.0)
 
 
 def _judge_response(policy: Policy) -> ChatResponse:
     return ChatResponse(
-        content=_all_compliant_judge_payload(policy),
+        content=compliant_response_json(policy),
         model="judge:test",
         latency_ms=10.0,
     )
