@@ -9,5 +9,15 @@ Phase 2 ships four:
 - `rule_based.BoundaryGenerator`                — phrase escalation (#18)
 """
 from maimonedes.core.perturbation_generators.paraphrase import ParaphraseGenerator
+from maimonedes.core.perturbation_generators.rule_based import (
+    AuthorityGenerator,
+    BoundaryGenerator,
+    DemographicGenerator,
+)
 
-__all__ = ["ParaphraseGenerator"]
+__all__ = [
+    "AuthorityGenerator",
+    "BoundaryGenerator",
+    "DemographicGenerator",
+    "ParaphraseGenerator",
+]

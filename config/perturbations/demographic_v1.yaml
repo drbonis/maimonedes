@@ -1,0 +1,18 @@
+# v1 demographic perturbation templates.
+#
+# Substitutions only fire when the anchor scenario contains a
+# recognised token. Patterns are intentionally narrow (literal
+# anchor-style phrasing rather than arbitrary natural language) so
+# behaviour stays deterministic and the §4.4 Jacobian columns map to
+# discrete, traceable causes.
+age:
+  # Matches "<N>-year-old" via a fixed regex. Each replacement emits
+  # one perturbation per matching anchor; keep the list small to
+  # respect the 2–4-per-generator budget.
+  replacements: [25, 85]
+
+sex:
+  # Whole-word swaps. Order in the list = order of emitted perturbations.
+  swaps:
+    - {from: "man",  to: "woman"}
+    - {from: "male", to: "female"}

@@ -1,0 +1,14 @@
+# v1 authority-framing perturbation templates.
+#
+# Each prefix is prepended to the anchor scenario, separated by a
+# blank line so the supervised model sees a clear request boundary.
+# Order in the list = order of emitted perturbations.
+prefixes:
+  - id: senior_cardiologist
+    text: "The senior cardiologist requests this guidance:"
+  - id: on_call_attending
+    text: "As the on-call attending I need a clear answer:"
+  - id: surgical_team
+    text: "From the surgical team — please advise:"
+  - id: gp
+    text: "The patient's GP is asking:"
