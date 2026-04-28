@@ -1,7 +1,11 @@
-"""Phase 1 dashboard.
+"""Multi-page dashboard entry point.
 
-A single Streamlit page that shows the most-recent compliance score
-per anchor, plus per-sub-condition detail and a small history chart.
+Streamlit auto-mounts every `.py` file under `dashboard/pages/` as a
+sidebar entry. This module is the landing page; the actual content
+lives in:
+
+- pages/01_compliance_scores.py  — Phase 1 per-anchor score table
+- pages/02_fragility.py           — Phase 2 Jacobian + fragility table
 
 Run with: `streamlit run src/maimonedes/dashboard/app.py`
 """
@@ -9,53 +13,20 @@ from __future__ import annotations
 
 import streamlit as st
 
-from maimonedes.storage.compliance import latest_score_per_anchor
-from maimonedes.storage.dashboard_queries import (
-    history_for_anchor,
-    latest_table_rows,
-)
-
-PAGE_TITLE = "Compliance scores — Phase 1"
-
-
-@st.cache_data(ttl=10)
-def _cached_latest_rows() -> list[dict[str, object]]:
-    return latest_table_rows()
+PAGE_TITLE = "maimonedes dashboard"
 
 
 def _render() -> None:
     st.set_page_config(page_title=PAGE_TITLE, layout="wide")
     st.title(PAGE_TITLE)
-
-    rows = _cached_latest_rows()
-    if not rows:
-        st.info(
-            "No compliance scores recorded yet. Run "
-            "`maimonedes run-once <anchor-id>` to populate this dashboard."
-        )
-        return
-
-    st.subheader("Latest score per anchor")
-    st.dataframe(rows, use_container_width=True, hide_index=True)
-
-    latest = latest_score_per_anchor()
-    st.subheader("Per-anchor detail")
-    for anchor_id in sorted(latest.keys()):
-        score = latest[anchor_id]
-        with st.expander(
-            f"{anchor_id} — aggregate {score.aggregate:.3f} "
-            f"(policy {score.policy_id}, judge {score.judge_model})"
-        ):
-            st.write("**Per-sub-condition**")
-            for sub_id in sorted(score.per_sub_condition):
-                value = score.per_sub_condition[sub_id]
-                st.write(f"- `{sub_id}`: {value:.3f}")
-
-            history = history_for_anchor(anchor_id, limit=20)
-            if len(history) > 1:
-                st.write("**Recent aggregate history**")
-                chart_values = [s.aggregate for s in history]
-                st.line_chart(chart_values)
+    st.markdown(
+        "Black-box behavioral supervision for clinical-decision LLMs.\n\n"
+        "Use the sidebar to navigate:\n\n"
+        "- **Compliance scores — Phase 1**: latest aggregate per anchor, "
+        "per-sub-condition detail, recent-aggregate history.\n"
+        "- **Fragility — Phase 2**: per-anchor Jacobian heatmap and "
+        "aggregated fragility table across the eight anchors."
+    )
 
 
 _render()

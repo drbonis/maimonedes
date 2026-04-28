@@ -27,7 +27,9 @@ from maimonedes.storage.repo import init_engine, reset_engine_for_tests
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ALEMBIC_INI = PROJECT_ROOT / "alembic.ini"
-DASHBOARD_APP = PROJECT_ROOT / "src" / "maimonedes" / "dashboard" / "app.py"
+DASHBOARD_DIR = PROJECT_ROOT / "src" / "maimonedes" / "dashboard"
+DASHBOARD_APP = DASHBOARD_DIR / "app.py"
+COMPLIANCE_PAGE = DASHBOARD_DIR / "pages" / "01_compliance_scores.py"
 
 
 def _alembic_cfg(database_url: str) -> Config:
@@ -131,7 +133,7 @@ def test_dashboard_renders_empty_state_when_db_is_empty(db: str) -> None:
     pytest.importorskip("streamlit.testing.v1")
     from streamlit.testing.v1 import AppTest
 
-    at = AppTest.from_file(str(DASHBOARD_APP)).run(timeout=30)
+    at = AppTest.from_file(str(COMPLIANCE_PAGE)).run(timeout=30)
     assert not at.exception, [str(e) for e in at.exception]
     assert at.title[0].value == "Compliance scores — Phase 1"
     # Empty-state message
@@ -146,7 +148,7 @@ def test_dashboard_renders_table_when_populated(db: str) -> None:
     _seed("A1", 0.6)
     _seed("A2", 0.4)
 
-    at = AppTest.from_file(str(DASHBOARD_APP)).run(timeout=30)
+    at = AppTest.from_file(str(COMPLIANCE_PAGE)).run(timeout=30)
     assert not at.exception, [str(e) for e in at.exception]
     assert at.title[0].value == "Compliance scores — Phase 1"
 
