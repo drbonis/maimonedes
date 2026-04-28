@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 import numpy as np
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from maimonedes.core.compliance import ComplianceScore
 from maimonedes.core.perturbation import PerturbationKind
@@ -129,15 +129,31 @@ class _ProbeScorePair:
 
 
 def _scored_perturbations(anchor_id: str) -> list[_ProbeScorePair]:
-    """Most-recent perturbation score per probe row for this anchor.
+    """Most-recent perturbation score per (anchor, transform_label).
 
-    Materialises the relevant fields inside the session so the returned
-    objects don't trigger detached-attribute lookups in the caller.
+    Re-running `maimonedes perturb` creates new probe rows with the
+    same `transform_label` values; the Jacobian wants the LATEST
+    direction, not the cartesian product. Without this dedup, pandas
+    Styler refuses to render the per-anchor heatmap because the
+    DataFrame index has duplicates.
+
+    Materialises the relevant fields inside the session so the
+    returned objects don't trigger detached-attribute lookups in the
+    caller.
     """
     with get_session() as session:
+        # Latest probe row id per transform_label for this anchor.
+        latest_ids = session.execute(
+            select(func.max(PerturbationProbeRow.id))
+            .where(PerturbationProbeRow.anchor_id == anchor_id)
+            .group_by(PerturbationProbeRow.transform_label)
+        ).scalars().all()
+        if not latest_ids:
+            return []
+
         probe_rows = session.execute(
             select(PerturbationProbeRow).where(
-                PerturbationProbeRow.anchor_id == anchor_id
+                PerturbationProbeRow.id.in_(latest_ids)
             )
         ).scalars().all()
 

@@ -169,6 +169,26 @@ def test_jacobian_rows_sorted_by_total_abs_delta_descending(db: str) -> None:
     ]
 
 
+def test_jacobian_dedupes_repeated_perturb_runs(db: str) -> None:
+    """Re-running `maimonedes perturb` creates new probe rows with the
+    same transform_label. The Jacobian must collapse those into a
+    single row keyed by the transform_label, otherwise pandas Styler
+    refuses to render the heatmap."""
+    _seed_anchor_baseline("A1", aggregate=0.8)
+    # Three independent probe rows, all with the same transform_label.
+    _seed_perturbation("A1", "authority:gp", "authority", aggregate=0.4)
+    _seed_perturbation("A1", "authority:gp", "authority", aggregate=0.5)
+    _seed_perturbation("A1", "authority:gp", "authority", aggregate=0.6)
+
+    jac = jacobian_for_anchor("A1")
+    assert jac is not None
+    labels = [r.transform_label for r in jac.rows]
+    # One row, not three.
+    assert labels == ["authority:gp"]
+    # And it's the LATEST (highest-id) probe's score that wins.
+    assert jac.rows[0].deltas[AGGREGATE_COLUMN] == pytest.approx(0.6 - 0.8)
+
+
 def test_jacobian_uses_most_recent_perturbation_score(db: str) -> None:
     """If a perturbation is scored twice, Jacobian uses the most-recent."""
     import time

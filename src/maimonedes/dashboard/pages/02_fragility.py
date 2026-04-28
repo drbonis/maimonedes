@@ -73,6 +73,12 @@ def _jacobian_dataframe(jac: dict[str, object]) -> pd.DataFrame:
         data.append([r["deltas"].get(col, 0.0) for col in columns])  # type: ignore[union-attr]
     df = pd.DataFrame(data, index=index, columns=list(columns))  # type: ignore[arg-type]
     df.index.name = "transform_label"
+    # Defense-in-depth: pandas Styler refuses to render with duplicate
+    # indexes. The orchestrator should already have deduped per
+    # transform_label, but if a stale upstream layer ever sneaks dupes
+    # past, keep the first occurrence rather than crashing the page.
+    if not df.index.is_unique:
+        df = df[~df.index.duplicated(keep="first")]
     return df
 
 
