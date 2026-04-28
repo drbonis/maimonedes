@@ -15,7 +15,7 @@ managed to collect.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from maimonedes.core.compliance import ComplianceScore
@@ -51,6 +51,25 @@ class PerturbationOutcome:
     error: str | None
 
 
+@dataclass
+class PerturbationProgress:
+    """Streamed at each completed probe so callers can show live progress.
+
+    `index` is 1-based; `total` is the count returned by every generator
+    *combined*, computed up-front before any scoring begins so the
+    `[index/total]` ratio doesn't shift mid-run.
+    """
+
+    anchor_id: str
+    index: int
+    total: int
+    outcome: PerturbationOutcome
+
+
+ProgressCallback = Callable[[PerturbationProgress], None]
+GenerationCallback = Callable[[str, int], None]  # generator_name, n_probes
+
+
 def run_perturbations(
     anchor_id: str,
     *,
@@ -63,8 +82,17 @@ def run_perturbations(
     judge_model: str,
     replay: bool = False,
     supervised_temperature: float = 0.0,
+    on_outcome: ProgressCallback | None = None,
+    on_generation: GenerationCallback | None = None,
 ) -> list[PerturbationOutcome]:
-    """Generate, run, score, and persist perturbations for one anchor."""
+    """Generate, run, score, and persist perturbations for one anchor.
+
+    `on_outcome` fires once per probe, immediately after that probe's
+    score is persisted (or its failure is recorded). `on_generation`
+    fires once per generator with the count of probes that generator
+    produced — useful for printing "generating..." progress before the
+    scoring loop starts.
+    """
     anchor = get_anchor_by_id(list(anchors), anchor_id)
     if anchor.policy_id != policy.id:
         raise ValueError(
@@ -85,7 +113,11 @@ def run_perturbations(
         judge_rc, model=judge_model, supervised_model=supervised_model
     )
 
-    outcomes: list[PerturbationOutcome] = []
+    # Generate every probe up-front so `total` is known before the
+    # scoring loop streams progress events. Paraphrase's LLM call
+    # happens here too — emitting `on_generation` keeps the UI honest
+    # about why the first second or two is silent.
+    all_probes: list[PerturbationProbe] = []
     for gen in generators:
         try:
             probes = gen.generate(anchor)
@@ -98,19 +130,34 @@ def run_perturbations(
                     "error": str(exc),
                 },
             )
+            if on_generation is not None:
+                on_generation(type(gen).__name__, 0)
             continue
+        if on_generation is not None:
+            on_generation(type(gen).__name__, len(probes))
+        all_probes.extend(probes)
 
-        for probe in probes:
-            outcomes.append(
-                _run_single(
-                    anchor=anchor,
-                    probe=probe,
-                    policy=policy,
-                    supervised_rc=supervised_rc,
-                    judge=judge,
-                    supervised_model=supervised_model,
-                    supervised_temperature=supervised_temperature,
-                    baseline_aggregate=baseline_aggregate,
+    total = len(all_probes)
+    outcomes: list[PerturbationOutcome] = []
+    for idx, probe in enumerate(all_probes, start=1):
+        outcome = _run_single(
+            anchor=anchor,
+            probe=probe,
+            policy=policy,
+            supervised_rc=supervised_rc,
+            judge=judge,
+            supervised_model=supervised_model,
+            supervised_temperature=supervised_temperature,
+            baseline_aggregate=baseline_aggregate,
+        )
+        outcomes.append(outcome)
+        if on_outcome is not None:
+            on_outcome(
+                PerturbationProgress(
+                    anchor_id=anchor.id,
+                    index=idx,
+                    total=total,
+                    outcome=outcome,
                 )
             )
 
@@ -176,8 +223,11 @@ def _run_single(
 
 
 __all__ = [
+    "GenerationCallback",
     "JUDGE_BACKEND_NAME",
     "PerturbationOutcome",
+    "PerturbationProgress",
+    "ProgressCallback",
     "SUPERVISED_BACKEND_NAME",
     "run_perturbations",
 ]

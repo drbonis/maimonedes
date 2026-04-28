@@ -32,6 +32,7 @@ from maimonedes.experiments.calibrate_judge import (
 )
 from maimonedes.experiments.perturbation_session import (
     PerturbationOutcome,
+    PerturbationProgress,
     run_perturbations,
 )
 from maimonedes.experiments.run_session import run_once as run_once_session
@@ -300,27 +301,41 @@ def _build_generators(
     return out
 
 
+def _format_outcome_line(progress: PerturbationProgress) -> str:
+    """`[02/11] authority:senior_cardiologist  agg=0.420  Δ=-0.473`"""
+    o = progress.outcome
+    digits = max(2, len(str(progress.total)))
+    counter = f"[{progress.index:0{digits}d}/{progress.total:0{digits}d}]"
+    if o.score is None:
+        return f"  {counter} {o.probe.transform_label}  FAIL  ({o.error})"
+    delta_str = (
+        f"Δ={o.delta_aggregate:+.3f}"
+        if o.delta_aggregate is not None
+        else "Δ=n/a"
+    )
+    return (
+        f"  {counter} {o.probe.transform_label}  "
+        f"agg={o.score.aggregate:.3f}  {delta_str}"
+    )
+
+
+def _stream_outcome(progress: PerturbationProgress) -> None:
+    typer.echo(_format_outcome_line(progress))
+
+
+def _stream_generation(generator_name: str, n_probes: int) -> None:
+    typer.echo(f"  generating {generator_name} ... {n_probes} probe(s)")
+
+
 def _print_perturbation_summary(
     anchor_id: str, outcomes: list[PerturbationOutcome]
 ) -> None:
+    """Final per-anchor summary line — per-probe lines streamed live above."""
     if not outcomes:
-        typer.echo(f"anchor={anchor_id}: no perturbations generated")
+        typer.echo(f"  no perturbations generated for anchor={anchor_id}")
         return
     successes = [o for o in outcomes if o.score is not None]
     failures = [o for o in outcomes if o.score is None]
-    typer.echo(f"anchor={anchor_id}")
-    for o in outcomes:
-        if o.score is None:
-            typer.echo(f"  {o.probe.transform_label}  FAIL  ({o.error})")
-            continue
-        delta_str = (
-            f"Δ={o.delta_aggregate:+.3f}"
-            if o.delta_aggregate is not None
-            else "Δ=n/a"
-        )
-        typer.echo(
-            f"  {o.probe.transform_label}  agg={o.score.aggregate:.3f}  {delta_str}"
-        )
     if successes and any(o.delta_aggregate is not None for o in successes):
         deltas = [
             abs(o.delta_aggregate)
@@ -328,12 +343,12 @@ def _print_perturbation_summary(
             if o.delta_aggregate is not None
         ]
         typer.echo(
-            f"summary: n={len(successes)}/{len(outcomes)} "
+            f"  summary: n={len(successes)}/{len(outcomes)} "
             f"mean|Δ|={sum(deltas) / len(deltas):.3f} failures={len(failures)}"
         )
     else:
         typer.echo(
-            f"summary: n={len(successes)}/{len(outcomes)} "
+            f"  summary: n={len(successes)}/{len(outcomes)} "
             f"failures={len(failures)} (no baseline → Δ unavailable)"
         )
 
@@ -408,8 +423,17 @@ def perturb_cmd(
     target_ids: list[str] = (
         [a.id for a in anchors] if all_anchors else [anchor_id or ""]
     )
+    typer.echo(
+        f"running perturbations on {len(target_ids)} anchor(s); "
+        f"kinds={','.join(kinds_list)}"
+    )
+
     failures = 0
-    for aid in target_ids:
+    for i, aid in enumerate(target_ids, start=1):
+        if all_anchors:
+            typer.echo(f"[{i}/{len(target_ids)}] anchor={aid}")
+        else:
+            typer.echo(f"anchor={aid}")
         try:
             outcomes = run_perturbations(
                 aid,
@@ -421,6 +445,8 @@ def perturb_cmd(
                 supervised_model=settings.ollama_supervised_model,
                 judge_model=settings.ollama_judge_model,
                 replay=replay,
+                on_outcome=_stream_outcome,
+                on_generation=_stream_generation,
             )
         except KeyError as exc:
             typer.echo(f"unknown anchor id: {exc}", err=True)

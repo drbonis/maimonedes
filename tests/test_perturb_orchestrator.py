@@ -254,6 +254,79 @@ def test_anchor_baseline_unaffected_by_perturbation_run(
     assert latest["A1"].probe_role == "anchor"
 
 
+def test_run_perturbations_streams_progress_callback(
+    db: str, policy: Policy
+) -> None:
+    """`on_outcome` fires once per probe with index 1..N and a stable total."""
+    from maimonedes.experiments.perturbation_session import PerturbationProgress
+
+    responses: list[ChatResponse] = []
+    for _ in range(4):
+        responses.append(_supervised_response())
+        responses.append(_judge_response(policy))
+    fake = FakeLLMClient(responses=responses)
+    anchors = load_anchors(PROBES_PATH)
+    events: list[PerturbationProgress] = []
+
+    run_perturbations(
+        "A1",
+        policy=policy,
+        anchors=anchors,
+        supervised_client=fake,
+        judge_client=fake,
+        generators=[AuthorityGenerator(AUTH_PATH)],
+        supervised_model="supervised:test",
+        judge_model="judge:test",
+        on_outcome=events.append,
+    )
+
+    assert len(events) == 4
+    assert [e.index for e in events] == [1, 2, 3, 4]
+    assert all(e.total == 4 for e in events)
+    assert all(e.anchor_id == "A1" for e in events)
+    # The outcome on the progress event matches what the function returns.
+    assert {e.outcome.probe.transform_label for e in events} == {
+        "authority:senior_cardiologist",
+        "authority:on_call_attending",
+        "authority:surgical_team",
+        "authority:gp",
+    }
+
+
+def test_run_perturbations_emits_generation_event_per_generator(
+    db: str, policy: Policy
+) -> None:
+    """`on_generation` fires once per generator with the probe count."""
+    responses: list[ChatResponse] = []
+    for _ in range(8):  # 4 authority + 4-ish boundary
+        responses.append(_supervised_response())
+        responses.append(_judge_response(policy))
+    fake = FakeLLMClient(responses=responses)
+    anchors = load_anchors(PROBES_PATH)
+    seen: list[tuple[str, int]] = []
+
+    run_perturbations(
+        "A1",
+        policy=policy,
+        anchors=anchors,
+        supervised_client=fake,
+        judge_client=fake,
+        generators=[AuthorityGenerator(AUTH_PATH), BoundaryGenerator(BOUND_PATH)],
+        supervised_model="supervised:test",
+        judge_model="judge:test",
+        on_generation=lambda name, n: seen.append((name, n)),
+    )
+
+    names = [name for name, _ in seen]
+    assert names == ["AuthorityGenerator", "BoundaryGenerator"]
+    # Authority always emits 4; boundary emits whatever the v1 templates
+    # match against A1's scenario (we don't pin the exact count here —
+    # just that the event fired with a non-negative integer).
+    counts = [n for _, n in seen]
+    assert counts[0] == 4
+    assert counts[1] >= 0
+
+
 def test_run_perturbations_unknown_anchor_raises(db: str, policy: Policy) -> None:
     fake = FakeLLMClient()
     anchors = load_anchors(PROBES_PATH)
@@ -313,6 +386,71 @@ def test_cli_perturb_authority_only_persists_rows(
     assert "anchor=A1" in result.output
     assert "authority:senior_cardiologist" in result.output
     assert len(recent_perturbations("A1")) == 4
+
+
+def test_cli_perturb_streams_per_probe_progress(
+    db: str, cli_backend: FakeLLMClient
+) -> None:
+    """Each completed probe should appear with a `[NN/MM]` counter, and a
+    `generating ...` line should announce each generator phase."""
+    result = runner.invoke(
+        app,
+        [
+            "perturb",
+            "A1",
+            "--kinds",
+            "authority",
+            "--policy",
+            str(POLICY_PATH),
+            "--rubric",
+            str(RUBRIC_PATH),
+            "--probes",
+            str(PROBES_PATH),
+            "--authority-path",
+            str(AUTH_PATH),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "running perturbations on 1 anchor(s)" in result.output
+    assert "generating AuthorityGenerator" in result.output
+    # 4 authority probes → counters 01..04 of 04 (zero-padded)
+    assert "[01/04] authority:senior_cardiologist" in result.output
+    assert "[02/04] authority:on_call_attending" in result.output
+    assert "[03/04] authority:surgical_team" in result.output
+    assert "[04/04] authority:gp" in result.output
+    # Final summary line stays as before
+    assert "summary: n=4/4" in result.output
+
+
+def test_cli_perturb_all_anchors_prefixes_with_anchor_index(
+    db: str, policy: Policy, cli_backend: FakeLLMClient
+) -> None:
+    cli_backend._queue.clear()  # type: ignore[attr-defined]
+    for _ in range(64):
+        cli_backend.queue(_supervised_response())
+        cli_backend.queue(_judge_response(policy))
+
+    result = runner.invoke(
+        app,
+        [
+            "perturb",
+            "--all-anchors",
+            "--kinds",
+            "authority",
+            "--policy",
+            str(POLICY_PATH),
+            "--rubric",
+            str(RUBRIC_PATH),
+            "--probes",
+            str(PROBES_PATH),
+            "--authority-path",
+            str(AUTH_PATH),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # Each anchor block has a `[i/8]` header
+    for i in range(1, 9):
+        assert f"[{i}/8] anchor=A{i}" in result.output
 
 
 def test_cli_perturb_unknown_kind_rejected(
