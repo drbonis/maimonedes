@@ -38,6 +38,10 @@ from maimonedes.experiments.run_session import run_once as run_once_session
 from maimonedes.llm.client import LLMError, Message
 from maimonedes.llm.ollama_backend import OllamaBackend
 from maimonedes.llm.recording_client import RecordingClient
+from maimonedes.monitor.fragility import (
+    aggregated_fragility,
+    all_jacobians,
+)
 from maimonedes.settings import Settings, get_settings
 
 PING_PROMPT = "Reply with the single word PONG."
@@ -432,6 +436,86 @@ def perturb_cmd(
 
     if failures and failures == len(target_ids):
         raise typer.Exit(code=2)
+
+
+@app.command("fragility-report")
+def fragility_report_cmd(
+    output_dir: Path = typer.Option(
+        DEFAULT_REPORTS_DIR,
+        "--output-dir",
+        help="Directory under which the fragility CSV is written.",
+    ),
+) -> None:
+    """Compute and persist the §4.4 Jacobian + aggregated fragility table.
+
+    Reads from the DB only — no LLM calls. Writes
+    `reports/fragility_<UTC>.csv` with the aggregated table at the top
+    followed by a per-anchor Jacobian section.
+    """
+    import csv
+    from datetime import datetime, timezone
+
+    table = aggregated_fragility()
+    jacobians = all_jacobians()
+
+    if not jacobians and not table.cells:
+        typer.echo(
+            "no perturbation data found; run `maimonedes perturb` first",
+            err=True,
+        )
+        raise typer.Exit(code=4)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / f"fragility_{timestamp}.csv"
+
+    with report_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["# aggregated fragility (mean Δ across anchors)"])
+        writer.writerow(["perturbation_kind", *table.columns, "n"])
+        grid = table.as_grid()
+        for kind in table.perturbation_kinds:
+            row = [kind]
+            counts: list[int] = []
+            for col in table.columns:
+                cell = grid.get((kind, col))
+                if cell is None:
+                    row.append("")
+                else:
+                    row.append(f"{cell.mean_delta:+.4f}")
+                    counts.append(cell.count)
+            row.append(str(max(counts) if counts else 0))
+            writer.writerow(row)
+
+        writer.writerow([])
+        writer.writerow(["# per-anchor jacobian"])
+        for anchor_id in sorted(jacobians):
+            jac = jacobians[anchor_id]
+            writer.writerow([])
+            writer.writerow(
+                [
+                    f"## {anchor_id}",
+                    f"baseline_aggregate={jac.baseline_aggregate:.4f}",
+                ]
+            )
+            writer.writerow(["transform_label", "perturbation_kind", *jac.columns])
+            for jrow in jac.rows:
+                writer.writerow(
+                    [
+                        jrow.transform_label,
+                        jrow.perturbation_kind,
+                        *[
+                            f"{jrow.deltas.get(col, 0.0):+.4f}"
+                            for col in jac.columns
+                        ],
+                    ]
+                )
+
+    typer.echo(f"wrote {report_path}")
+    typer.echo(
+        f"summary: anchors={len(jacobians)} kinds={len(table.perturbation_kinds)} "
+        f"cells={len(table.cells)}"
+    )
 
 
 def main(argv: list[str] | None = None) -> None:

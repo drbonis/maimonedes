@@ -52,7 +52,7 @@ class ComplianceScoreRow(Base):
     )
 
 
-def _row_to_score(row: ComplianceScoreRow) -> ComplianceScore:
+def row_to_score(row: ComplianceScoreRow) -> ComplianceScore:
     try:
         per_sub = json.loads(row.per_sub_condition_json)
     except json.JSONDecodeError:
@@ -108,7 +108,7 @@ def recent_scores(anchor_id: str, *, limit: int = 50) -> list[ComplianceScore]:
             .limit(limit)
         )
         rows = session.execute(stmt).scalars().all()
-        return [_row_to_score(r) for r in rows]
+        return [row_to_score(r) for r in rows]
 
 
 def latest_score_per_anchor() -> dict[str, ComplianceScore]:
@@ -141,7 +141,7 @@ def latest_score_per_anchor() -> dict[str, ComplianceScore]:
                 .limit(1)
             ).scalar_one_or_none()
             if row is not None:
-                out[aid] = _row_to_score(row)
+                out[aid] = row_to_score(row)
         return out
 
 
@@ -165,7 +165,7 @@ def latest_anchor_baseline(anchor_id: str) -> ComplianceScore | None:
             )
             .limit(1)
         ).scalar_one_or_none()
-        return _row_to_score(row) if row is not None else None
+        return row_to_score(row) if row is not None else None
 
 
 __all__ = [
@@ -174,4 +174,5 @@ __all__ = [
     "latest_score_per_anchor",
     "record_score",
     "recent_scores",
+    "row_to_score",
 ]
