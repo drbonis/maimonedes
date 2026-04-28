@@ -23,6 +23,8 @@ htmlcov/
 *.sqlite-journal
 *.sqlite3
 *.db
+*.bak
+*.vboxsf-bak
 
 # Generated reports (calibration runs, drift summaries, etc.)
 reports/

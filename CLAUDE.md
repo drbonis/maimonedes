@@ -40,3 +40,28 @@ uv run pytest
 ```
 
 Sourcing is idempotent — safe to add to `~/.bashrc`'s repo cd hook.
+
+### `database disk image is malformed` during `maimonedes perturb`
+
+Same root cause as the venv issue: `vboxsf`. SQLite needs POSIX file
+locking + reliable `fsync`, neither of which `vboxsf` implements
+faithfully. Single-write workloads usually survive; multi-write
+runs like `maimonedes perturb` or `maimonedes calibrate` corrupt
+the file mid-transaction and every subsequent insert blows up with:
+
+```
+(sqlite3.DatabaseError) database disk image is malformed
+```
+
+Fix: keep the SQLite file off the shared folder. The committed
+`.env.example` and the local `.env` point at
+`/home/vagrant/maimonedes.db` (ext4) for this reason. If a fresh
+clone hasn't created `.env` yet, set the URL explicitly:
+
+```bash
+export DATABASE_URL=sqlite:////home/vagrant/maimonedes.db
+```
+
+Existing data on a vboxsf-resident DB is recoverable as long as
+`PRAGMA integrity_check` returns `ok` — just `cp` it onto ext4 and
+update the URL.
