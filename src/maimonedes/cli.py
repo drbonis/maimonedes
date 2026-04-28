@@ -1,23 +1,34 @@
 """Command-line entry point for maimonedes.
 
-Phase 0 ships a single subcommand, `ping`, that exercises the entire
-stack (settings -> client -> backend -> recording -> storage) so we
-can prove all the wiring works before any policy / probe / scoring
-code lands in Phase 1.
+Subcommands so far:
+- `ping`     — Phase 0 smoke test (settings -> client -> backend ->
+              recording -> storage)
+- `run-once` — Phase 1 deliverable: load anchor, send to supervised
+              system, score with judge, persist `ComplianceScore`.
 """
 from __future__ import annotations
 
 import sys
 from collections.abc import Callable, Iterable
+from pathlib import Path
 
 import typer
 
+from maimonedes.core.policy import load_policy
+from maimonedes.core.probe import load_anchors
+from maimonedes.experiments.run_session import run_once as run_once_session
 from maimonedes.llm.client import LLMError, Message
 from maimonedes.llm.ollama_backend import OllamaBackend
 from maimonedes.llm.recording_client import RecordingClient
 from maimonedes.settings import Settings, get_settings
 
 PING_PROMPT = "Reply with the single word PONG."
+
+# Default config paths — relative to wherever the CLI is invoked.
+# `--policy` / `--rubric` / `--probes` flags override.
+DEFAULT_POLICY_PATH = Path("config/policies/scope_of_practice.yaml")
+DEFAULT_RUBRIC_PATH = Path("config/rubrics/scope_of_practice.yaml")
+DEFAULT_PROBES_PATH = Path("config/probes/anchors_v1.yaml")
 
 app = typer.Typer(
     add_completion=False,
@@ -109,6 +120,61 @@ def ping(
     except Exception as exc:  # storage / config / unexpected
         typer.echo(f"ping failed: {exc}", err=True)
         raise typer.Exit(code=3) from exc
+
+
+@app.command("run-once")
+def run_once_cmd(
+    anchor_id: str = typer.Argument(..., help="Anchor id, e.g. A3."),
+    policy_path: Path = typer.Option(
+        DEFAULT_POLICY_PATH, "--policy", help="Path to the policy YAML."
+    ),
+    rubric_path: Path = typer.Option(
+        DEFAULT_RUBRIC_PATH, "--rubric", help="Path to the rubric YAML."
+    ),
+    probes_path: Path = typer.Option(
+        DEFAULT_PROBES_PATH, "--probes", help="Path to the anchor library YAML."
+    ),
+    replay: bool = typer.Option(
+        False,
+        "--replay",
+        help="Use the RecordingClient replay cache for both supervised "
+        "and judge calls. Misses still go live and seed the cache.",
+    ),
+) -> None:
+    """Score one anchor end-to-end and persist the result."""
+    settings = get_settings()
+    try:
+        policy = load_policy(policy_path, rubric_path)
+        anchors = load_anchors(probes_path)
+        backend = _backend_factory(settings)
+        score = run_once_session(
+            anchor_id,
+            policy=policy,
+            anchors=anchors,
+            supervised_client=backend,  # type: ignore[arg-type]
+            judge_client=backend,  # type: ignore[arg-type]
+            supervised_model=settings.ollama_supervised_model,
+            judge_model=settings.ollama_judge_model,
+            replay=replay,
+        )
+    except KeyError as exc:
+        typer.echo(f"unknown anchor id: {exc}", err=True)
+        raise typer.Exit(code=4) from exc
+    except ValueError as exc:
+        typer.echo(f"invalid configuration: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+    except LLMError as exc:
+        typer.echo(f"LLM backend error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    except FileNotFoundError as exc:
+        typer.echo(f"config file not found: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+
+    typer.echo(f"anchor={score.anchor_id}")
+    typer.echo(f"policy={score.policy_id}")
+    typer.echo(f"aggregate={score.aggregate:.3f}")
+    for sub_id in sorted(score.per_sub_condition):
+        typer.echo(f"  {sub_id} = {score.per_sub_condition[sub_id]:.3f}")
 
 
 def main(argv: list[str] | None = None) -> None:
