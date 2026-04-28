@@ -1,10 +1,13 @@
 """Command-line entry point for maimonedes.
 
-Subcommands so far:
-- `ping`     — Phase 0 smoke test (settings -> client -> backend ->
-              recording -> storage)
-- `run-once` — Phase 1 deliverable: load anchor, send to supervised
-              system, score with judge, persist `ComplianceScore`.
+Subcommands:
+- `ping`        — Phase 0 smoke test (settings → client → backend →
+                  recording → storage)
+- `run-once`    — Phase 1 deliverable: load anchor, send to supervised
+                  system, score with judge, persist `ComplianceScore`
+- `calibrate`   — Phase 1 calibration harness over the reference corpus
+- `perturb`     — Phase 2: generate a perturbation cloud for an anchor
+                  (or all eight) and persist the cloud's scores
 """
 from __future__ import annotations
 
@@ -14,11 +17,22 @@ from pathlib import Path
 
 import typer
 
+from maimonedes.core.perturbation import PerturbationGenerator
+from maimonedes.core.perturbation_generators import (
+    AuthorityGenerator,
+    BoundaryGenerator,
+    DemographicGenerator,
+    ParaphraseGenerator,
+)
 from maimonedes.core.policy import load_policy
 from maimonedes.core.probe import load_anchors
 from maimonedes.experiments.calibrate_judge import (
     load_references,
     run_calibration,
+)
+from maimonedes.experiments.perturbation_session import (
+    PerturbationOutcome,
+    run_perturbations,
 )
 from maimonedes.experiments.run_session import run_once as run_once_session
 from maimonedes.llm.client import LLMError, Message
@@ -35,6 +49,10 @@ DEFAULT_RUBRIC_PATH = Path("config/rubrics/scope_of_practice.yaml")
 DEFAULT_PROBES_PATH = Path("config/probes/anchors_v1.yaml")
 DEFAULT_REFERENCES_PATH = Path("config/calibration/references_v1.yaml")
 DEFAULT_REPORTS_DIR = Path("reports")
+DEFAULT_DEMOGRAPHIC_PATH = Path("config/perturbations/demographic_v1.yaml")
+DEFAULT_AUTHORITY_PATH = Path("config/perturbations/authority_v1.yaml")
+DEFAULT_BOUNDARY_PATH = Path("config/perturbations/boundary_v1.yaml")
+ALL_KINDS = ("paraphrase", "demographic", "authority", "boundary")
 
 app = typer.Typer(
     add_completion=False,
@@ -242,6 +260,178 @@ def calibrate_cmd(
     if report.status == "red":
         # Roadmap risks section: red-band judge blocks Phase 2.
         raise typer.Exit(code=6)
+
+
+def _build_generators(
+    kinds: list[str],
+    *,
+    paraphrase_client: object,
+    paraphrase_model: str,
+    paraphrase_n: int,
+    demographic_path: Path,
+    authority_path: Path,
+    boundary_path: Path,
+) -> list[PerturbationGenerator]:
+    out: list[PerturbationGenerator] = []
+    for kind in kinds:
+        if kind == "paraphrase":
+            out.append(
+                ParaphraseGenerator(
+                    paraphrase_client,  # type: ignore[arg-type]
+                    model=paraphrase_model,
+                    n=paraphrase_n,
+                )
+            )
+        elif kind == "demographic":
+            out.append(DemographicGenerator(demographic_path))
+        elif kind == "authority":
+            out.append(AuthorityGenerator(authority_path))
+        elif kind == "boundary":
+            out.append(BoundaryGenerator(boundary_path))
+        else:
+            raise typer.BadParameter(
+                f"unknown perturbation kind: {kind!r}; "
+                f"expected one of {ALL_KINDS}"
+            )
+    return out
+
+
+def _print_perturbation_summary(
+    anchor_id: str, outcomes: list[PerturbationOutcome]
+) -> None:
+    if not outcomes:
+        typer.echo(f"anchor={anchor_id}: no perturbations generated")
+        return
+    successes = [o for o in outcomes if o.score is not None]
+    failures = [o for o in outcomes if o.score is None]
+    typer.echo(f"anchor={anchor_id}")
+    for o in outcomes:
+        if o.score is None:
+            typer.echo(f"  {o.probe.transform_label}  FAIL  ({o.error})")
+            continue
+        delta_str = (
+            f"Δ={o.delta_aggregate:+.3f}"
+            if o.delta_aggregate is not None
+            else "Δ=n/a"
+        )
+        typer.echo(
+            f"  {o.probe.transform_label}  agg={o.score.aggregate:.3f}  {delta_str}"
+        )
+    if successes and any(o.delta_aggregate is not None for o in successes):
+        deltas = [
+            abs(o.delta_aggregate)
+            for o in successes
+            if o.delta_aggregate is not None
+        ]
+        typer.echo(
+            f"summary: n={len(successes)}/{len(outcomes)} "
+            f"mean|Δ|={sum(deltas) / len(deltas):.3f} failures={len(failures)}"
+        )
+    else:
+        typer.echo(
+            f"summary: n={len(successes)}/{len(outcomes)} "
+            f"failures={len(failures)} (no baseline → Δ unavailable)"
+        )
+
+
+@app.command("perturb")
+def perturb_cmd(
+    anchor_id: str = typer.Argument(
+        None,
+        help="Anchor id (e.g. A3). Omit when --all-anchors is passed.",
+    ),
+    all_anchors: bool = typer.Option(
+        False, "--all-anchors", help="Sweep A1..A8 sequentially."
+    ),
+    kinds: str = typer.Option(
+        ",".join(ALL_KINDS),
+        "--kinds",
+        help="Comma-separated subset of {paraphrase,demographic,authority,boundary}.",
+    ),
+    paraphrase_n: int = typer.Option(
+        3, "--paraphrase-n", help="Number of paraphrases per anchor."
+    ),
+    replay: bool = typer.Option(
+        False,
+        "--replay",
+        help="Use the RecordingClient replay cache for supervised + judge calls.",
+    ),
+    policy_path: Path = typer.Option(DEFAULT_POLICY_PATH, "--policy"),
+    rubric_path: Path = typer.Option(DEFAULT_RUBRIC_PATH, "--rubric"),
+    probes_path: Path = typer.Option(DEFAULT_PROBES_PATH, "--probes"),
+    demographic_path: Path = typer.Option(
+        DEFAULT_DEMOGRAPHIC_PATH, "--demographic-path"
+    ),
+    authority_path: Path = typer.Option(
+        DEFAULT_AUTHORITY_PATH, "--authority-path"
+    ),
+    boundary_path: Path = typer.Option(
+        DEFAULT_BOUNDARY_PATH, "--boundary-path"
+    ),
+) -> None:
+    """Generate, run, and score a perturbation cloud for one anchor (or all)."""
+    if not all_anchors and anchor_id is None:
+        raise typer.BadParameter("Provide an anchor id or pass --all-anchors.")
+
+    kinds_list = [k.strip() for k in kinds.split(",") if k.strip()]
+    for k in kinds_list:
+        if k not in ALL_KINDS:
+            raise typer.BadParameter(
+                f"unknown kind {k!r}; expected one of {ALL_KINDS}"
+            )
+
+    settings = get_settings()
+    try:
+        policy = load_policy(policy_path, rubric_path)
+        anchors = load_anchors(probes_path)
+        backend = _backend_factory(settings)
+        generators = _build_generators(
+            kinds_list,
+            paraphrase_client=backend,
+            paraphrase_model=settings.ollama_supervised_model,
+            paraphrase_n=paraphrase_n,
+            demographic_path=demographic_path,
+            authority_path=authority_path,
+            boundary_path=boundary_path,
+        )
+    except FileNotFoundError as exc:
+        typer.echo(f"config file not found: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+    except (ValueError, KeyError) as exc:
+        typer.echo(f"invalid configuration: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+
+    target_ids: list[str] = (
+        [a.id for a in anchors] if all_anchors else [anchor_id or ""]
+    )
+    failures = 0
+    for aid in target_ids:
+        try:
+            outcomes = run_perturbations(
+                aid,
+                policy=policy,
+                anchors=anchors,
+                supervised_client=backend,  # type: ignore[arg-type]
+                judge_client=backend,  # type: ignore[arg-type]
+                generators=generators,
+                supervised_model=settings.ollama_supervised_model,
+                judge_model=settings.ollama_judge_model,
+                replay=replay,
+            )
+        except KeyError as exc:
+            typer.echo(f"unknown anchor id: {exc}", err=True)
+            raise typer.Exit(code=4) from exc
+        except ValueError as exc:
+            typer.echo(f"invalid configuration: {exc}", err=True)
+            raise typer.Exit(code=5) from exc
+        except LLMError as exc:
+            typer.echo(f"LLM backend error on {aid}: {exc}", err=True)
+            failures += 1
+            continue
+        _print_perturbation_summary(aid, outcomes)
+
+    if failures and failures == len(target_ids):
+        raise typer.Exit(code=2)
 
 
 def main(argv: list[str] | None = None) -> None:
