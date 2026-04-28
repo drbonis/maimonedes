@@ -24,6 +24,9 @@ htmlcov/
 *.sqlite3
 *.db
 
+# Generated reports (calibration runs, drift summaries, etc.)
+reports/
+
 # Secrets / local config
 .env
 

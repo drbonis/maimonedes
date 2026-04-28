@@ -16,6 +16,10 @@ import typer
 
 from maimonedes.core.policy import load_policy
 from maimonedes.core.probe import load_anchors
+from maimonedes.experiments.calibrate_judge import (
+    load_references,
+    run_calibration,
+)
 from maimonedes.experiments.run_session import run_once as run_once_session
 from maimonedes.llm.client import LLMError, Message
 from maimonedes.llm.ollama_backend import OllamaBackend
@@ -29,6 +33,8 @@ PING_PROMPT = "Reply with the single word PONG."
 DEFAULT_POLICY_PATH = Path("config/policies/scope_of_practice.yaml")
 DEFAULT_RUBRIC_PATH = Path("config/rubrics/scope_of_practice.yaml")
 DEFAULT_PROBES_PATH = Path("config/probes/anchors_v1.yaml")
+DEFAULT_REFERENCES_PATH = Path("config/calibration/references_v1.yaml")
+DEFAULT_REPORTS_DIR = Path("reports")
 
 app = typer.Typer(
     add_completion=False,
@@ -175,6 +181,67 @@ def run_once_cmd(
     typer.echo(f"aggregate={score.aggregate:.3f}")
     for sub_id in sorted(score.per_sub_condition):
         typer.echo(f"  {sub_id} = {score.per_sub_condition[sub_id]:.3f}")
+
+
+@app.command("calibrate")
+def calibrate_cmd(
+    references_path: Path = typer.Option(
+        DEFAULT_REFERENCES_PATH, "--references", help="Path to the calibration corpus YAML."
+    ),
+    policy_path: Path = typer.Option(
+        DEFAULT_POLICY_PATH, "--policy", help="Path to the policy YAML."
+    ),
+    rubric_path: Path = typer.Option(
+        DEFAULT_RUBRIC_PATH, "--rubric", help="Path to the rubric YAML."
+    ),
+    probes_path: Path = typer.Option(
+        DEFAULT_PROBES_PATH, "--probes", help="Path to the anchor library YAML."
+    ),
+    output_dir: Path = typer.Option(
+        DEFAULT_REPORTS_DIR,
+        "--output-dir",
+        help="Where to write the calibration CSV report.",
+    ),
+) -> None:
+    """Score the calibration corpus and emit a Spearman / MAE / status report."""
+    settings = get_settings()
+    try:
+        references = load_references(references_path)
+        policy = load_policy(policy_path, rubric_path)
+        anchors = load_anchors(probes_path)
+        backend = _backend_factory(settings)
+        report = run_calibration(
+            references,
+            policy=policy,
+            anchors=anchors,
+            judge_client=backend,  # type: ignore[arg-type]
+            judge_model=settings.ollama_judge_model,
+            supervised_model=settings.ollama_supervised_model,
+            output_dir=output_dir,
+        )
+    except FileNotFoundError as exc:
+        typer.echo(f"config file not found: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+    except (ValueError, KeyError) as exc:
+        typer.echo(f"invalid configuration: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+    except LLMError as exc:
+        typer.echo(f"LLM backend error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    typer.echo(report.summary_line())
+    typer.echo(f"report={report.report_path}")
+    for b in report.bins:
+        if b.n == 0:
+            typer.echo(f"  bin [{b.lower:.2f}, {b.upper:.2f}]   empty")
+        else:
+            typer.echo(
+                f"  bin [{b.lower:.2f}, {b.upper:.2f}] n={b.n} "
+                f"pred={b.mean_predicted:.3f} hand={b.mean_hand:.3f}"
+            )
+    if report.status == "red":
+        # Roadmap risks section: red-band judge blocks Phase 2.
+        raise typer.Exit(code=6)
 
 
 def main(argv: list[str] | None = None) -> None:
