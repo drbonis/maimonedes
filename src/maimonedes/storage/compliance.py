@@ -41,6 +41,12 @@ class ComplianceScoreRow(Base):
     llm_call_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("llm_calls.id"), nullable=True
     )
+    perturbation_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("perturbation_probes.id"), nullable=True
+    )
+    probe_role: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="anchor", server_default="anchor"
+    )
     scored_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -65,6 +71,8 @@ def _row_to_score(row: ComplianceScoreRow) -> ComplianceScore:
         judge_model=row.judge_model,
         supervised_model=row.supervised_model,
         llm_call_id=row.llm_call_id,
+        perturbation_id=row.perturbation_id,
+        probe_role=row.probe_role,  # type: ignore[arg-type]
         scored_at=scored_at,
     )
 
@@ -81,6 +89,8 @@ def record_score(score: ComplianceScore) -> int:
             judge_model=score.judge_model,
             supervised_model=score.supervised_model,
             llm_call_id=score.llm_call_id,
+            perturbation_id=score.perturbation_id,
+            probe_role=score.probe_role,
             scored_at=score.scored_at,
         )
         session.add(row)
@@ -102,22 +112,28 @@ def recent_scores(anchor_id: str, *, limit: int = 50) -> list[ComplianceScore]:
 
 
 def latest_score_per_anchor() -> dict[str, ComplianceScore]:
-    """Most-recent score for every anchor that has at least one row.
+    """Most-recent ANCHOR score for every anchor that has at least one row.
 
-    Used by the Phase 1 dashboard. Not the world's tightest query
-    plan, but the table has at most a few hundred thousand rows
-    even after the full drift study, and the `(anchor_id, scored_at)`
-    index makes the per-anchor scan cheap.
+    Filters out perturbation rows (`probe_role = "perturbation"`) so the
+    Phase 1 dashboard table is unaffected by Phase 2 cloud generation.
+    Not the world's tightest query plan, but the table has at most a
+    few hundred thousand rows even after the full drift study, and the
+    `(anchor_id, scored_at)` index makes the per-anchor scan cheap.
     """
     with get_session() as session:
         anchor_ids = session.execute(
-            select(ComplianceScoreRow.anchor_id).distinct()
+            select(ComplianceScoreRow.anchor_id)
+            .where(ComplianceScoreRow.probe_role == "anchor")
+            .distinct()
         ).scalars().all()
         out: dict[str, ComplianceScore] = {}
         for aid in anchor_ids:
             row = session.execute(
                 select(ComplianceScoreRow)
-                .where(ComplianceScoreRow.anchor_id == aid)
+                .where(
+                    ComplianceScoreRow.anchor_id == aid,
+                    ComplianceScoreRow.probe_role == "anchor",
+                )
                 .order_by(
                     ComplianceScoreRow.scored_at.desc(),
                     ComplianceScoreRow.id.desc(),
@@ -129,8 +145,32 @@ def latest_score_per_anchor() -> dict[str, ComplianceScore]:
         return out
 
 
+def latest_anchor_baseline(anchor_id: str) -> ComplianceScore | None:
+    """Most-recent compliance score with `probe_role = "anchor"` for `anchor_id`.
+
+    Phase 2's Jacobian computation reads against this baseline. A
+    missing baseline means we have not yet run-once the anchor — the
+    Jacobian for that anchor is undefined.
+    """
+    with get_session() as session:
+        row = session.execute(
+            select(ComplianceScoreRow)
+            .where(
+                ComplianceScoreRow.anchor_id == anchor_id,
+                ComplianceScoreRow.probe_role == "anchor",
+            )
+            .order_by(
+                ComplianceScoreRow.scored_at.desc(),
+                ComplianceScoreRow.id.desc(),
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        return _row_to_score(row) if row is not None else None
+
+
 __all__ = [
     "ComplianceScoreRow",
+    "latest_anchor_baseline",
     "latest_score_per_anchor",
     "record_score",
     "recent_scores",

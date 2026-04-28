@@ -5,7 +5,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from maimonedes.settings import Settings, get_settings
@@ -19,7 +19,19 @@ def _build_engine(url: str, **engine_kwargs: Any) -> Engine:
     connect_args: dict[str, Any] = {}
     if url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
-    return create_engine(url, future=True, connect_args=connect_args, **engine_kwargs)
+    engine = create_engine(url, future=True, connect_args=connect_args, **engine_kwargs)
+    if url.startswith("sqlite"):
+        # SQLite ships with foreign-key enforcement OFF by default. Phase 2
+        # introduces a real cross-table FK (compliance_scores.perturbation_id
+        # -> perturbation_probes.id) that we want enforced; enabling the
+        # PRAGMA per-connection is the standard workaround.
+        @event.listens_for(engine, "connect")
+        def _enable_sqlite_foreign_keys(dbapi_connection: Any, _record: Any) -> None:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
+    return engine
 
 
 def init_engine(settings: Settings | None = None, **engine_kwargs: Any) -> Engine:

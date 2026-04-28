@@ -11,9 +11,12 @@ orchestrator + dashboard. ORM mapping lives in
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+
+ProbeRole = Literal["anchor", "perturbation"]
 
 
 def _utcnow() -> datetime:
@@ -30,6 +33,12 @@ class ComplianceScore(BaseModel):
     judge_model: str = Field(min_length=1)
     supervised_model: str = Field(min_length=1)
     llm_call_id: int | None = None
+    # Phase 2: scores can be evaluated on either the parent anchor
+    # (probe_role="anchor", perturbation_id=None) or a generated
+    # perturbation (probe_role="perturbation", perturbation_id set).
+    # `anchor_id` always names the parent anchor regardless of role.
+    perturbation_id: int | None = None
+    probe_role: ProbeRole = "anchor"
     scored_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -38,4 +47,4 @@ def to_payload(score: ComplianceScore) -> dict[str, Any]:
     return score.model_dump(mode="json")
 
 
-__all__ = ["ComplianceScore", "to_payload"]
+__all__ = ["ComplianceScore", "ProbeRole", "to_payload"]

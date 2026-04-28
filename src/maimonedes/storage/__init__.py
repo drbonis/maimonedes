@@ -5,4 +5,9 @@ key (e.g. compliance_scores.llm_call_id -> llm_calls.id) can resolve
 its target inside `Base.metadata` regardless of which module the
 caller imports first.
 """
-from maimonedes.storage import compliance, llm_calls, models  # noqa: F401
+from maimonedes.storage import (  # noqa: F401
+    compliance,
+    llm_calls,
+    models,
+    perturbations,
+)
