@@ -14,11 +14,11 @@ substitution map, etc. The framework does not interpret it.
 """
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import Field, model_validator
 
-from maimonedes.core.probe import Probe
+from maimonedes.core.probe import AnchorProbe, Probe
 
 
 PerturbationKind = Literal["paraphrase", "demographic", "authority", "boundary"]
@@ -47,4 +47,16 @@ class PerturbationProbe(Probe):
         return data
 
 
-__all__ = ["PerturbationKind", "PerturbationProbe"]
+@runtime_checkable
+class PerturbationGenerator(Protocol):
+    """Structural contract every perturbation generator implements.
+
+    Implementations may carry state set up at construction (LLM client,
+    YAML-loaded templates, RNG seed, etc.) but `generate()` must be
+    side-effect free with respect to global state.
+    """
+
+    def generate(self, anchor: AnchorProbe) -> list[PerturbationProbe]: ...
+
+
+__all__ = ["PerturbationGenerator", "PerturbationKind", "PerturbationProbe"]
