@@ -6,6 +6,7 @@ lives in:
 
 - pages/01_compliance_scores.py  — Phase 1 per-anchor score table
 - pages/02_fragility.py           — Phase 2 Jacobian + fragility table
+- pages/03_drift.py               — Phase 3 drift timeline + detector
 
 Run with: `streamlit run src/maimonedes/dashboard/app.py`
 """
@@ -25,7 +26,10 @@ def _render() -> None:
         "- **Compliance scores — Phase 1**: latest aggregate per anchor, "
         "per-sub-condition detail, recent-aggregate history.\n"
         "- **Fragility — Phase 2**: per-anchor Jacobian heatmap and "
-        "aggregated fragility table across the eight anchors."
+        "aggregated fragility table across the eight anchors.\n"
+        "- **Drift — Phase 3**: timeline plot of raw aggregate, EWMA, "
+        "and CUSUM across a synthetic drift run with detection-latency "
+        "annotations."
     )
 
 
