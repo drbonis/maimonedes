@@ -335,6 +335,107 @@ def test_run_perturbations_unknown_anchor_raises(db: str, policy: Policy) -> Non
         )
 
 
+def test_run_perturbations_with_replicates_creates_n_probe_rows_per_label(
+    db: str, policy: Policy
+) -> None:
+    """`replicates=3` runs each generator + scoring loop 3 times.
+    For deterministic generators (authority), each (anchor,
+    transform_label) gets exactly N probe rows, all stamped with the
+    same `run_id` and distinct `replicate_index`."""
+    from maimonedes.storage.perturbations import recent_perturbations
+
+    # 4 authority probes × 3 replicates = 12 supervised + 12 judge calls
+    responses: list[ChatResponse] = []
+    for _ in range(12):
+        responses.append(_supervised_response())
+        responses.append(_judge_response(policy))
+    fake = FakeLLMClient(responses=responses)
+    anchors = load_anchors(PROBES_PATH)
+
+    outcomes = run_perturbations(
+        "A1",
+        policy=policy,
+        anchors=anchors,
+        supervised_client=fake,
+        judge_client=fake,
+        generators=[AuthorityGenerator(AUTH_PATH)],
+        supervised_model="supervised:test",
+        judge_model="judge:test",
+        replicates=3,
+    )
+    # 4 authority labels × 3 replicates = 12 outcomes
+    assert len(outcomes) == 12
+    assert all(o.score is not None for o in outcomes)
+
+    probes = recent_perturbations("A1", limit=50)
+    assert len(probes) == 12
+
+    # All probes share one run_id; replicate_index spans 0..2.
+    run_ids = {p.generator_metadata.get("run_id") for p in probes}
+    assert len(run_ids) == 1
+    assert next(iter(run_ids)) is not None
+
+    rep_indexes_per_label: dict[str, set[int]] = {}
+    for p in probes:
+        rep_indexes_per_label.setdefault(p.transform_label, set()).add(
+            p.generator_metadata.get("replicate_index")
+        )
+    for label, indexes in rep_indexes_per_label.items():
+        assert indexes == {0, 1, 2}, f"{label} replicates: {indexes}"
+
+
+def test_run_perturbations_progress_includes_replicate_info(
+    db: str, policy: Policy
+) -> None:
+    from maimonedes.experiments.perturbation_session import PerturbationProgress
+
+    responses: list[ChatResponse] = []
+    for _ in range(8):  # 4 probes × 2 replicates
+        responses.append(_supervised_response())
+        responses.append(_judge_response(policy))
+    fake = FakeLLMClient(responses=responses)
+    anchors = load_anchors(PROBES_PATH)
+    events: list[PerturbationProgress] = []
+
+    run_perturbations(
+        "A1",
+        policy=policy,
+        anchors=anchors,
+        supervised_client=fake,
+        judge_client=fake,
+        generators=[AuthorityGenerator(AUTH_PATH)],
+        supervised_model="supervised:test",
+        judge_model="judge:test",
+        replicates=2,
+        on_outcome=events.append,
+    )
+    assert len(events) == 8
+    assert all(e.total == 4 for e in events)
+    assert all(e.replicates_total == 2 for e in events)
+    rep_indexes = [e.replicate_index for e in events]
+    # First 4 events are replicate 0, next 4 are replicate 1.
+    assert rep_indexes == [0, 0, 0, 0, 1, 1, 1, 1]
+
+
+def test_run_perturbations_rejects_zero_replicates(
+    db: str, policy: Policy
+) -> None:
+    fake = FakeLLMClient()
+    anchors = load_anchors(PROBES_PATH)
+    with pytest.raises(ValueError, match="replicates"):
+        run_perturbations(
+            "A1",
+            policy=policy,
+            anchors=anchors,
+            supervised_client=fake,
+            judge_client=fake,
+            generators=[AuthorityGenerator(AUTH_PATH)],
+            supervised_model="supervised:test",
+            judge_model="judge:test",
+            replicates=0,
+        )
+
+
 # ---- CLI -------------------------------------------------------------------
 
 

@@ -10,15 +10,24 @@ Aggregation: each (perturbation_kind, sub-condition) cell is the mean
 Δ across (anchor × perturbation-of-that-kind). Anchors without a
 recorded baseline are skipped with a structured warning, never
 synthesised — that would tilt the aggregate.
+
+Replicate-aware aggregation: when `maimonedes perturb` is run with
+`--replicates N`, each `(anchor, transform_label)` produces N probe
+rows sharing a single `run_id` stamped in their `generator_metadata`.
+The Jacobian groups by `transform_label` within the most-recent
+`run_id`, computes per-axis mean ± std across the N replicates, and
+reports both. With N=1 the std is zero by construction.
 """
 from __future__ import annotations
 
+import json
 import logging
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from maimonedes.core.compliance import ComplianceScore
 from maimonedes.core.perturbation import PerturbationKind
@@ -40,7 +49,9 @@ AGGREGATE_COLUMN = "aggregate"
 class JacobianRow:
     transform_label: str
     perturbation_kind: PerturbationKind
-    deltas: dict[str, float]  # column id ("aggregate" or sub_id) -> Δ
+    deltas: dict[str, float]  # mean Δ per column (single Δ when n=1)
+    std_deltas: dict[str, float] = field(default_factory=dict)  # std Δ across replicates; all-zero when n=1
+    n_replicates: int = 1
 
 
 @dataclass(frozen=True)
@@ -70,7 +81,8 @@ class FragilityCell:
     perturbation_kind: PerturbationKind
     column: str  # "aggregate" or a sub_condition_id
     mean_delta: float
-    count: int
+    count: int  # number of contributing anchors (each anchor's mean Δ counts once)
+    std_delta: float = 0.0  # between-anchor std (zero when only one anchor contributes)
 
 
 @dataclass(frozen=True)
@@ -100,22 +112,42 @@ def _columns_for(baseline: ComplianceScore) -> list[str]:
     return [AGGREGATE_COLUMN, *sorted(baseline.per_sub_condition.keys())]
 
 
-def _delta_row(
+def _delta_row_from_replicates(
     transform_label: str,
     perturbation_kind: PerturbationKind,
     baseline: ComplianceScore,
-    score: ComplianceScore,
+    scores: list[ComplianceScore],
 ) -> JacobianRow:
-    deltas: dict[str, float] = {
-        AGGREGATE_COLUMN: score.aggregate - baseline.aggregate
-    }
-    for sub_id, base_val in baseline.per_sub_condition.items():
-        pert_val = score.per_sub_condition.get(sub_id, 0.0)
-        deltas[sub_id] = pert_val - base_val
+    """Aggregate one or more replicate scores into a single JacobianRow.
+
+    For each column (aggregate + every sub-condition id), computes
+    `mean(replicate_score - baseline_score)` and `std(...)` across the
+    replicate samples. With one replicate the std is zero.
+    """
+    if not scores:
+        raise ValueError("scores list must be non-empty")
+
+    by_column: dict[str, list[float]] = defaultdict(list)
+    for score in scores:
+        by_column[AGGREGATE_COLUMN].append(score.aggregate - baseline.aggregate)
+        for sub_id, base_val in baseline.per_sub_condition.items():
+            pert_val = score.per_sub_condition.get(sub_id, 0.0)
+            by_column[sub_id].append(pert_val - base_val)
+
+    deltas = {col: float(np.mean(vals)) for col, vals in by_column.items()}
+    std_deltas: dict[str, float] = {}
+    for col, vals in by_column.items():
+        if len(vals) > 1:
+            std_deltas[col] = float(np.std(vals, ddof=1))
+        else:
+            std_deltas[col] = 0.0
+
     return JacobianRow(
         transform_label=transform_label,
         perturbation_kind=perturbation_kind,
         deltas=deltas,
+        std_deltas=std_deltas,
+        n_replicates=len(scores),
     )
 
 
@@ -126,39 +158,76 @@ class _ProbeScorePair:
     transform_label: str
     perturbation_kind: str
     score: ComplianceScore
+    run_id: str | None  # from generator_metadata; None for legacy probes
+
+
+def _parse_metadata(probe: PerturbationProbeRow) -> dict[str, Any]:
+    try:
+        parsed = json.loads(probe.generator_metadata_json or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _scored_perturbations(anchor_id: str) -> list[_ProbeScorePair]:
-    """Most-recent perturbation score per (anchor, transform_label).
+    """Replicates of every `transform_label` from the most recent run.
 
-    Re-running `maimonedes perturb` creates new probe rows with the
-    same `transform_label` values; the Jacobian wants the LATEST
-    direction, not the cartesian product. Without this dedup, pandas
-    Styler refuses to render the per-anchor heatmap because the
-    DataFrame index has duplicates.
+    Behaviour:
 
-    Materialises the relevant fields inside the session so the
-    returned objects don't trigger detached-attribute lookups in the
-    caller.
+    - For probes with `run_id` in `generator_metadata` (post-replicates
+      schema): for each `transform_label`, find the highest-id probe
+      and use its `run_id` as the canonical "latest run". Return ALL
+      probes from that `(transform_label, run_id)` tuple — those are
+      the replicates the Jacobian aggregates across.
+    - For legacy probes without `run_id`: fall back to the previous
+      single-row dedup — the highest-id probe per `transform_label`
+      wins. This preserves the prior `re-running perturb means latest
+      observation supersedes` semantics.
     """
     with get_session() as session:
-        # Latest probe row id per transform_label for this anchor.
-        latest_ids = session.execute(
-            select(func.max(PerturbationProbeRow.id))
-            .where(PerturbationProbeRow.anchor_id == anchor_id)
-            .group_by(PerturbationProbeRow.transform_label)
-        ).scalars().all()
-        if not latest_ids:
+        all_probes = (
+            session.execute(
+                select(PerturbationProbeRow)
+                .where(PerturbationProbeRow.anchor_id == anchor_id)
+                .order_by(PerturbationProbeRow.id.desc())
+            )
+            .scalars()
+            .all()
+        )
+        if not all_probes:
             return []
 
-        probe_rows = session.execute(
-            select(PerturbationProbeRow).where(
-                PerturbationProbeRow.id.in_(latest_ids)
-            )
-        ).scalars().all()
+        # First pass: for each transform_label, identify the run_id (or
+        # absence thereof) of the latest probe. That's the canonical
+        # "current run" for that label.
+        latest_run_per_label: dict[str, str | None] = {}
+        latest_id_per_label: dict[str, int] = {}
+        for probe in all_probes:  # already ordered id desc
+            label = probe.transform_label
+            if label in latest_run_per_label:
+                continue
+            metadata = _parse_metadata(probe)
+            latest_run_per_label[label] = metadata.get("run_id")
+            latest_id_per_label[label] = probe.id
 
+        # Second pass: keep probes that match the canonical run for
+        # their label. Legacy (run_id=None): only the highest-id probe
+        # qualifies (single observation, no replicates). New (run_id
+        # set): all probes sharing that run_id are replicate samples.
         out: list[_ProbeScorePair] = []
-        for probe in probe_rows:
+        for probe in all_probes:
+            label = probe.transform_label
+            metadata = _parse_metadata(probe)
+            probe_run = metadata.get("run_id")
+            expected_run = latest_run_per_label[label]
+
+            if expected_run is None:
+                if probe.id != latest_id_per_label[label]:
+                    continue
+            else:
+                if probe_run != expected_run:
+                    continue
+
             score_row = session.execute(
                 select(ComplianceScoreRow)
                 .where(
@@ -178,13 +247,18 @@ def _scored_perturbations(anchor_id: str) -> list[_ProbeScorePair]:
                     transform_label=probe.transform_label,
                     perturbation_kind=probe.perturbation_kind,
                     score=row_to_score(score_row),
+                    run_id=probe_run,
                 )
             )
         return out
 
 
 def jacobian_for_anchor(anchor_id: str) -> Jacobian | None:
-    """Return the per-anchor §4.4 Jacobian, or None if no baseline exists."""
+    """Return the per-anchor §4.4 Jacobian, or None if no baseline exists.
+
+    With replicate-aware aggregation, each `JacobianRow` carries
+    mean Δ + std Δ + n_replicates per column.
+    """
     baseline = latest_anchor_baseline(anchor_id)
     if baseline is None:
         log.warning(
@@ -194,14 +268,20 @@ def jacobian_for_anchor(anchor_id: str) -> Jacobian | None:
         return None
 
     pairs = _scored_perturbations(anchor_id)
+
+    # Group replicates by transform_label.
+    grouped: dict[str, list[_ProbeScorePair]] = defaultdict(list)
+    for pair in pairs:
+        grouped[pair.transform_label].append(pair)
+
     rows = [
-        _delta_row(
-            pair.transform_label,
-            pair.perturbation_kind,  # type: ignore[arg-type]
+        _delta_row_from_replicates(
+            label,
+            label_pairs[0].perturbation_kind,  # type: ignore[arg-type]
             baseline,
-            pair.score,
+            [p.score for p in label_pairs],
         )
-        for pair in pairs
+        for label, label_pairs in grouped.items()
     ]
     rows.sort(
         key=lambda r: sum(abs(v) for v in r.deltas.values()),
@@ -231,8 +311,13 @@ def aggregated_fragility() -> FragilityTable:
     """Mean Δ across all anchors, indexed by (perturbation_kind, column).
 
     Each (kind, column) cell is the mean over (anchor × perturbation-
-    of-that-kind). Anchors without a baseline are skipped (logged at
-    WARNING) so the aggregate stays honest.
+    of-that-kind), where each anchor's contribution is its own
+    *replicate-mean* Δ for that column. The reported `std_delta` is
+    the between-anchor std of those means; the within-anchor replicate
+    std is preserved at the per-anchor Jacobian level.
+
+    Anchors without a baseline are skipped (logged at WARNING) so the
+    aggregate stays honest.
     """
     accum: dict[tuple[str, str], list[float]] = {}
     columns_seen: set[str] = set()
@@ -250,15 +335,17 @@ def aggregated_fragility() -> FragilityTable:
                     (row.perturbation_kind, column), []
                 ).append(delta)
 
-    cells = [
-        FragilityCell(
-            perturbation_kind=kind,  # type: ignore[arg-type]
-            column=column,
-            mean_delta=float(np.mean(deltas)),
-            count=len(deltas),
+    cells = []
+    for (kind, column), deltas in sorted(accum.items()):
+        cells.append(
+            FragilityCell(
+                perturbation_kind=kind,  # type: ignore[arg-type]
+                column=column,
+                mean_delta=float(np.mean(deltas)),
+                std_delta=float(np.std(deltas, ddof=1)) if len(deltas) > 1 else 0.0,
+                count=len(deltas),
+            )
         )
-        for (kind, column), deltas in sorted(accum.items())
-    ]
     # Stable, sorted order: aggregate first, then sub-conditions alphabetically.
     columns_list = (
         ([AGGREGATE_COLUMN] if AGGREGATE_COLUMN in columns_seen else [])

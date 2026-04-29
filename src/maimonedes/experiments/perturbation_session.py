@@ -15,6 +15,7 @@ managed to collect.
 from __future__ import annotations
 
 import logging
+import secrets
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
@@ -61,19 +62,32 @@ class PerturbationOutcome:
 class PerturbationProgress:
     """Streamed at each completed probe so callers can show live progress.
 
-    `index` is 1-based; `total` is the count returned by every generator
-    *combined*, computed up-front before any scoring begins so the
-    `[index/total]` ratio doesn't shift mid-run.
+    `index` is 1-based within a single replicate; `total` is the
+    per-replicate probe count. `replicate_index` is 0-based and
+    `replicates_total` reflects the orchestrator's `replicates`
+    parameter (1 when not in replicate mode).
     """
 
     anchor_id: str
     index: int
     total: int
     outcome: PerturbationOutcome
+    replicate_index: int = 0
+    replicates_total: int = 1
 
 
 ProgressCallback = Callable[[PerturbationProgress], None]
 GenerationCallback = Callable[[str, int], None]  # generator_name, n_probes
+
+
+def _new_run_id() -> str:
+    """Short opaque run identifier stamped into every probe's metadata.
+
+    All probes from a single `run_perturbations` invocation share this
+    id; the Jacobian aggregator uses it to pick replicates from the
+    most recent run when computing per-cell mean ± std.
+    """
+    return secrets.token_hex(8)
 
 
 def run_perturbations(
@@ -90,6 +104,7 @@ def run_perturbations(
     supervised_temperature: float = 0.0,
     on_outcome: ProgressCallback | None = None,
     on_generation: GenerationCallback | None = None,
+    replicates: int = 1,
 ) -> list[PerturbationOutcome]:
     """Generate, run, score, and persist perturbations for one anchor.
 
@@ -98,7 +113,20 @@ def run_perturbations(
     fires once per generator with the count of probes that generator
     produced — useful for printing "generating..." progress before the
     scoring loop starts.
+
+    When `replicates > 1`, the entire generate-and-score pipeline runs
+    N times for the anchor. Each replicate gets a fresh call into
+    every generator (so paraphrase produces different rewrites each
+    replicate at its own temperature=0.7) and fresh supervised + judge
+    calls. All probes from a single `run_perturbations` invocation
+    share a single `run_id` stamped into their `generator_metadata`,
+    plus a per-replicate `replicate_index`. The Jacobian aggregator
+    uses these to group replicates of the same `(anchor, transform_label)`
+    condition and report mean ± std.
     """
+    if replicates < 1:
+        raise ValueError(f"replicates must be >= 1, got {replicates}")
+
     anchor = get_anchor_by_id(list(anchors), anchor_id)
     if anchor.policy_id != policy.id:
         raise ValueError(
@@ -119,53 +147,68 @@ def run_perturbations(
         judge_rc, model=judge_model, supervised_model=supervised_model
     )
 
-    # Generate every probe up-front so `total` is known before the
-    # scoring loop streams progress events. Paraphrase's LLM call
-    # happens here too — emitting `on_generation` keeps the UI honest
-    # about why the first second or two is silent.
-    all_probes: list[PerturbationProbe] = []
-    for gen in generators:
-        try:
-            probes = gen.generate(anchor)
-        except Exception as exc:  # generator-level failure → skip this generator
-            log.warning(
-                "perturbation_session.generator_failed",
-                extra={
-                    "anchor_id": anchor.id,
-                    "generator": type(gen).__name__,
-                    "error": str(exc),
-                },
-            )
-            if on_generation is not None:
-                on_generation(type(gen).__name__, 0)
-            continue
-        if on_generation is not None:
-            on_generation(type(gen).__name__, len(probes))
-        all_probes.extend(probes)
-
-    total = len(all_probes)
+    run_id = _new_run_id()
     outcomes: list[PerturbationOutcome] = []
-    for idx, probe in enumerate(all_probes, start=1):
-        outcome = _run_single(
-            anchor=anchor,
-            probe=probe,
-            policy=policy,
-            supervised_rc=supervised_rc,
-            judge=judge,
-            supervised_model=supervised_model,
-            supervised_temperature=supervised_temperature,
-            baseline_aggregate=baseline_aggregate,
-        )
-        outcomes.append(outcome)
-        if on_outcome is not None:
-            on_outcome(
-                PerturbationProgress(
-                    anchor_id=anchor.id,
-                    index=idx,
-                    total=total,
-                    outcome=outcome,
+
+    for replicate_idx in range(replicates):
+        # Generate every probe for this replicate up-front so `total`
+        # is known before the scoring loop streams progress events.
+        # `on_generation` fires only on the first replicate so the UI
+        # doesn't repeat the "generating ..." headers N times.
+        all_probes: list[PerturbationProbe] = []
+        for gen in generators:
+            try:
+                probes = gen.generate(anchor)
+            except Exception as exc:  # generator-level failure → skip this generator
+                log.warning(
+                    "perturbation_session.generator_failed",
+                    extra={
+                        "anchor_id": anchor.id,
+                        "generator": type(gen).__name__,
+                        "error": str(exc),
+                        "replicate_index": replicate_idx,
+                    },
                 )
+                if on_generation is not None and replicate_idx == 0:
+                    on_generation(type(gen).__name__, 0)
+                continue
+            if on_generation is not None and replicate_idx == 0:
+                on_generation(type(gen).__name__, len(probes))
+            all_probes.extend(probes)
+
+        total = len(all_probes)
+        for idx, probe in enumerate(all_probes, start=1):
+            stamped = probe.model_copy(
+                update={
+                    "generator_metadata": {
+                        **probe.generator_metadata,
+                        "run_id": run_id,
+                        "replicate_index": replicate_idx,
+                    }
+                }
             )
+            outcome = _run_single(
+                anchor=anchor,
+                probe=stamped,
+                policy=policy,
+                supervised_rc=supervised_rc,
+                judge=judge,
+                supervised_model=supervised_model,
+                supervised_temperature=supervised_temperature,
+                baseline_aggregate=baseline_aggregate,
+            )
+            outcomes.append(outcome)
+            if on_outcome is not None:
+                on_outcome(
+                    PerturbationProgress(
+                        anchor_id=anchor.id,
+                        index=idx,
+                        total=total,
+                        outcome=outcome,
+                        replicate_index=replicate_idx,
+                        replicates_total=replicates,
+                    )
+                )
 
     return outcomes
 

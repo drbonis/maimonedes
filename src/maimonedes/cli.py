@@ -331,10 +331,21 @@ def _build_generators(
 
 
 def _format_outcome_line(progress: PerturbationProgress) -> str:
-    """`[02/11] authority:senior_cardiologist  agg=0.420  Δ=-0.473`"""
+    """`[02/11] authority:senior_cardiologist  agg=0.420  Δ=-0.473`
+
+    With replicates > 1, prefixes a `[rep i/N]` counter:
+    `[rep 03/05][02/11] authority:senior_cardiologist  agg=0.420  Δ=-0.473`
+    """
     o = progress.outcome
     digits = max(2, len(str(progress.total)))
     counter = f"[{progress.index:0{digits}d}/{progress.total:0{digits}d}]"
+    if progress.replicates_total > 1:
+        rep_digits = max(2, len(str(progress.replicates_total)))
+        rep_counter = (
+            f"[rep {progress.replicate_index + 1:0{rep_digits}d}"
+            f"/{progress.replicates_total:0{rep_digits}d}]"
+        )
+        counter = f"{rep_counter}{counter}"
     if o.score is None:
         return f"  {counter} {o.probe.transform_label}  FAIL  ({o.error})"
     delta_str = (
@@ -399,10 +410,20 @@ def perturb_cmd(
     paraphrase_n: int = typer.Option(
         3, "--paraphrase-n", help="Number of paraphrases per anchor."
     ),
+    replicates: int = typer.Option(
+        1,
+        "--replicates",
+        "-r",
+        help="Number of independent replicate runs per anchor. N>1 enables "
+        "noise-floor estimation (mean Δ ± std Δ in the fragility report). "
+        "Each replicate re-invokes every generator and re-scores fresh.",
+    ),
     replay: bool = typer.Option(
         False,
         "--replay",
-        help="Use the RecordingClient replay cache for supervised + judge calls.",
+        help="Use the RecordingClient replay cache for supervised + judge calls. "
+        "Note: incompatible with replicates > 1 in spirit — the cache returns "
+        "identical responses, which collapses replicate variance to zero.",
     ),
     policy_path: Path = typer.Option(DEFAULT_POLICY_PATH, "--policy"),
     rubric_path: Path = typer.Option(DEFAULT_RUBRIC_PATH, "--rubric"),
@@ -426,6 +447,15 @@ def perturb_cmd(
     """Generate, run, and score a perturbation cloud for one anchor (or all)."""
     if not all_anchors and anchor_id is None:
         raise typer.BadParameter("Provide an anchor id or pass --all-anchors.")
+    if replicates < 1:
+        raise typer.BadParameter("--replicates must be >= 1.")
+    if replicates > 1 and replay:
+        typer.echo(
+            "warning: --replicates > 1 with --replay returns identical cached "
+            "responses for each replicate, collapsing variance to zero. "
+            "Drop --replay to measure real replicate variance.",
+            err=True,
+        )
 
     kinds_list = [k.strip() for k in kinds.split(",") if k.strip()]
     for k in kinds_list:
@@ -461,9 +491,10 @@ def perturb_cmd(
     target_ids: list[str] = (
         [a.id for a in anchors] if all_anchors else [anchor_id or ""]
     )
+    rep_suffix = f"; replicates={replicates}" if replicates > 1 else ""
     typer.echo(
         f"running perturbations on {len(target_ids)} anchor(s); "
-        f"kinds={','.join(kinds_list)}"
+        f"kinds={','.join(kinds_list)}{rep_suffix}"
     )
 
     failures = 0
@@ -485,6 +516,7 @@ def perturb_cmd(
                 replay=replay,
                 on_outcome=_stream_outcome,
                 on_generation=_stream_generation,
+                replicates=replicates,
             )
         except KeyError as exc:
             typer.echo(f"unknown anchor id: {exc}", err=True)
@@ -535,8 +567,20 @@ def fragility_report_cmd(
 
     with report_path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["# aggregated fragility (mean Δ across anchors)"])
-        writer.writerow(["perturbation_kind", *table.columns, "n"])
+        # ---- Aggregated section ----------------------------------------
+        # Per axis: mean Δ + between-anchor std. `n_anchors` is the
+        # max number of anchors that contributed to any cell in the row
+        # (some axes may have fewer if generators didn't fire on every
+        # anchor; we report the maximum so the row's coverage is the
+        # most-favourable interpretation).
+        writer.writerow(["# aggregated fragility (mean Δ across anchors ± between-anchor std)"])
+        agg_header = ["perturbation_kind"]
+        for col in table.columns:
+            agg_header.append(col)
+            agg_header.append(f"{col}_std")
+        agg_header.append("n_anchors")
+        writer.writerow(agg_header)
+
         grid = table.as_grid()
         for kind in table.perturbation_kinds:
             row = [kind]
@@ -545,14 +589,20 @@ def fragility_report_cmd(
                 cell = grid.get((kind, col))
                 if cell is None:
                     row.append("")
+                    row.append("")
                 else:
                     row.append(f"{cell.mean_delta:+.4f}")
+                    row.append(f"{cell.std_delta:.4f}")
                     counts.append(cell.count)
             row.append(str(max(counts) if counts else 0))
             writer.writerow(row)
 
+        # ---- Per-anchor jacobian section --------------------------------
+        # Per cell: mean Δ + within-replicate std. `n_rep` is the number
+        # of replicates that contributed to the row's deltas; equals 1
+        # for non-replicate runs.
         writer.writerow([])
-        writer.writerow(["# per-anchor jacobian"])
+        writer.writerow(["# per-anchor jacobian (mean Δ ± within-replicate std)"])
         for anchor_id in sorted(jacobians):
             jac = jacobians[anchor_id]
             writer.writerow([])
@@ -562,18 +612,18 @@ def fragility_report_cmd(
                     f"baseline_aggregate={jac.baseline_aggregate:.4f}",
                 ]
             )
-            writer.writerow(["transform_label", "perturbation_kind", *jac.columns])
+            jac_header = ["transform_label", "perturbation_kind", "n_rep"]
+            for col in jac.columns:
+                jac_header.append(col)
+                jac_header.append(f"{col}_std")
+            writer.writerow(jac_header)
+
             for jrow in jac.rows:
-                writer.writerow(
-                    [
-                        jrow.transform_label,
-                        jrow.perturbation_kind,
-                        *[
-                            f"{jrow.deltas.get(col, 0.0):+.4f}"
-                            for col in jac.columns
-                        ],
-                    ]
-                )
+                row = [jrow.transform_label, jrow.perturbation_kind, str(jrow.n_replicates)]
+                for col in jac.columns:
+                    row.append(f"{jrow.deltas.get(col, 0.0):+.4f}")
+                    row.append(f"{jrow.std_deltas.get(col, 0.0):.4f}")
+                writer.writerow(row)
 
     typer.echo(f"wrote {report_path}")
     typer.echo(

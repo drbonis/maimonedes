@@ -78,13 +78,20 @@ def _seed_perturbation(
     kind: str,
     aggregate: float,
     sub_values: dict[str, float] | None = None,
+    run_id: str | None = None,
+    replicate_index: int | None = None,
 ) -> int:
+    metadata: dict[str, object] = {}
+    if run_id is not None:
+        metadata["run_id"] = run_id
+    if replicate_index is not None:
+        metadata["replicate_index"] = replicate_index
     probe = PerturbationProbe(
         anchor_id=anchor_id,
         scenario=f"perturbed by {transform_label}",
         perturbation_kind=kind,  # type: ignore[arg-type]
         transform_label=transform_label,
-        generator_metadata={},
+        generator_metadata=metadata,
     )
     row_id = record_perturbation(probe)
     record_score(
@@ -167,6 +174,107 @@ def test_jacobian_rows_sorted_by_total_abs_delta_descending(db: str) -> None:
         "boundary:should_to_will",
         "demographic:mild",
     ]
+
+
+def test_jacobian_aggregates_replicates_with_mean_and_std(db: str) -> None:
+    """Replicates from one run are kept and aggregated as mean ± std."""
+    _seed_anchor_baseline("A1", aggregate=0.8)
+    # 3 replicates of the same (anchor, transform_label), all sharing
+    # one run_id, with aggregate values 0.4, 0.5, 0.6 → mean Δ -0.30,
+    # std 0.10 (sample std, ddof=1).
+    for i, agg in enumerate([0.4, 0.5, 0.6]):
+        _seed_perturbation(
+            "A1",
+            "authority:gp",
+            "authority",
+            aggregate=agg,
+            run_id="run_abc",
+            replicate_index=i,
+        )
+
+    jac = jacobian_for_anchor("A1")
+    assert jac is not None
+    assert len(jac.rows) == 1
+    row = jac.rows[0]
+    assert row.transform_label == "authority:gp"
+    assert row.n_replicates == 3
+    assert row.deltas[AGGREGATE_COLUMN] == pytest.approx(-0.30, abs=1e-9)
+    assert row.std_deltas[AGGREGATE_COLUMN] == pytest.approx(0.10, abs=1e-9)
+
+
+def test_jacobian_replicates_from_different_runs_disambiguated_by_run_id(
+    db: str,
+) -> None:
+    """Re-running perturb with a new run creates new probes with a new
+    run_id; the Jacobian uses ONLY the latest run for each label."""
+    _seed_anchor_baseline("A1", aggregate=0.8)
+    # Old run: 2 replicates with aggregate 0.1 (mean Δ -0.7 — should be ignored)
+    for i in range(2):
+        _seed_perturbation(
+            "A1", "authority:gp", "authority",
+            aggregate=0.1, run_id="old_run", replicate_index=i,
+        )
+    # New run: 3 replicates with aggregate 0.5 (mean Δ -0.3 — should be used)
+    for i in range(3):
+        _seed_perturbation(
+            "A1", "authority:gp", "authority",
+            aggregate=0.5, run_id="new_run", replicate_index=i,
+        )
+
+    jac = jacobian_for_anchor("A1")
+    assert jac is not None
+    assert len(jac.rows) == 1
+    row = jac.rows[0]
+    assert row.n_replicates == 3
+    assert row.deltas[AGGREGATE_COLUMN] == pytest.approx(-0.30, abs=1e-9)
+    assert row.std_deltas[AGGREGATE_COLUMN] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_jacobian_legacy_probes_without_run_id_still_dedupe_to_latest(
+    db: str,
+) -> None:
+    """Probes without `run_id` (legacy schema) keep the prior dedup-to-
+    latest behaviour. Three legacy probes → only the highest-id one
+    contributes; n_replicates = 1."""
+    _seed_anchor_baseline("A1", aggregate=0.8)
+    _seed_perturbation("A1", "authority:gp", "authority", aggregate=0.4)
+    _seed_perturbation("A1", "authority:gp", "authority", aggregate=0.5)
+    _seed_perturbation("A1", "authority:gp", "authority", aggregate=0.6)
+
+    jac = jacobian_for_anchor("A1")
+    assert jac is not None
+    assert len(jac.rows) == 1
+    row = jac.rows[0]
+    assert row.n_replicates == 1
+    # Latest probe = 0.6 → Δ = -0.20
+    assert row.deltas[AGGREGATE_COLUMN] == pytest.approx(-0.20, abs=1e-9)
+    assert row.std_deltas[AGGREGATE_COLUMN] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_aggregated_fragility_has_std_column_with_replicates(db: str) -> None:
+    """Across-anchor std is non-zero when multiple anchors contribute
+    different mean Δs for the same (kind, column) cell."""
+    _seed_anchor_baseline("A1", aggregate=0.8)
+    _seed_anchor_baseline("A2", aggregate=0.8)
+    for i in range(3):
+        _seed_perturbation(
+            "A1", "authority:gp", "authority",
+            aggregate=0.4, run_id="r1", replicate_index=i,
+        )
+    for i in range(3):
+        _seed_perturbation(
+            "A2", "authority:gp", "authority",
+            aggregate=0.6, run_id="r2", replicate_index=i,
+        )
+
+    table = aggregated_fragility()
+    cell = table.cell("authority", AGGREGATE_COLUMN)
+    assert cell is not None
+    # Mean of two anchor means (-0.4 and -0.2) → -0.30
+    assert cell.mean_delta == pytest.approx(-0.30, abs=1e-9)
+    # Between-anchor std of [-0.4, -0.2] with ddof=1 → ≈ 0.1414
+    assert cell.std_delta == pytest.approx(0.1414, abs=1e-3)
+    assert cell.count == 2
 
 
 def test_jacobian_dedupes_repeated_perturb_runs(db: str) -> None:
