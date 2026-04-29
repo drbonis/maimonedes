@@ -17,6 +17,7 @@ from pathlib import Path
 
 import typer
 
+from maimonedes.core.drift import DriftSchedule
 from maimonedes.core.perturbation import PerturbationGenerator
 from maimonedes.core.perturbation_generators import (
     AuthorityGenerator,
@@ -31,6 +32,10 @@ from maimonedes.core.probe import load_anchors
 from maimonedes.experiments.calibrate_judge import (
     load_references,
     run_calibration,
+)
+from maimonedes.experiments.induce_drift import (
+    DriftSessionProgress,
+    run_drift,
 )
 from maimonedes.experiments.perturbation_session import (
     PARAPHRASE_BACKEND_NAME,
@@ -62,6 +67,7 @@ DEFAULT_AUTHORITY_PATH = Path("config/perturbations/authority_v1.yaml")
 DEFAULT_BOUNDARY_PATH = Path("config/perturbations/boundary_v1.yaml")
 DEFAULT_ETHNICITY_PATH = Path("config/perturbations/ethnicity_v1.yaml")
 DEFAULT_PROFESSION_PATH = Path("config/perturbations/profession_v1.yaml")
+DEFAULT_DRIFT_SCHEDULE_PATH = Path("config/drift/scope_of_practice_v1.yaml")
 ALL_KINDS = (
     "paraphrase",
     "demographic",
@@ -532,6 +538,134 @@ def perturb_cmd(
 
     if failures and failures == len(target_ids):
         raise typer.Exit(code=2)
+
+
+def _stream_drift_progress(progress: DriftSessionProgress) -> None:
+    """`S03 baseline A1 aggregate=0.912` — one line per (session, anchor)."""
+    o = progress.outcome
+    if o.score is None:
+        typer.echo(
+            f"  S{progress.session_index:02d} {progress.stage_label} "
+            f"{progress.anchor_id}  FAIL  ({o.error})"
+        )
+    else:
+        typer.echo(
+            f"  S{progress.session_index:02d} {progress.stage_label} "
+            f"{progress.anchor_id}  aggregate={o.score.aggregate:.3f}"
+        )
+
+
+@app.command("induce-drift")
+def induce_drift_cmd(
+    schedule_path: Path = typer.Option(
+        DEFAULT_DRIFT_SCHEDULE_PATH,
+        "--schedule",
+        help="Path to the drift schedule YAML.",
+    ),
+    anchors_arg: str | None = typer.Option(
+        None,
+        "--anchors",
+        help="Comma-separated anchor ids (default: all from --probes).",
+    ),
+    policy_path: Path = typer.Option(DEFAULT_POLICY_PATH, "--policy"),
+    rubric_path: Path = typer.Option(DEFAULT_RUBRIC_PATH, "--rubric"),
+    probes_path: Path = typer.Option(DEFAULT_PROBES_PATH, "--probes"),
+    replay: bool = typer.Option(
+        False,
+        "--replay",
+        help="Use the RecordingClient replay cache for supervised + judge calls. "
+        "Useful for re-tuning detectors on the same data without burning tokens.",
+    ),
+    notes: str | None = typer.Option(
+        None, "--notes", help="Free-form note stored on the drift_run row."
+    ),
+    k_threshold: float = typer.Option(
+        4.0,
+        "--k",
+        help="CUSUM threshold tuner constant (h = k·σ). Persisted on the run.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print schedule and anchor count without making any LLM calls.",
+    ),
+) -> None:
+    """Execute the synthetic drift schedule and persist per-session scores."""
+    if k_threshold <= 0:
+        raise typer.BadParameter("--k must be > 0")
+
+    try:
+        schedule = DriftSchedule.from_yaml(schedule_path)
+        policy = load_policy(policy_path, rubric_path)
+        anchors = load_anchors(probes_path)
+    except FileNotFoundError as exc:
+        typer.echo(f"config file not found: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+    except (ValueError, KeyError) as exc:
+        typer.echo(f"invalid configuration: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+
+    if anchors_arg:
+        wanted = {a.strip() for a in anchors_arg.split(",") if a.strip()}
+        anchors = [a for a in anchors if a.id in wanted]
+        missing = wanted - {a.id for a in anchors}
+        if missing:
+            typer.echo(
+                f"unknown anchor ids: {sorted(missing)}", err=True
+            )
+            raise typer.Exit(code=4)
+
+    n_sessions = schedule.total_sessions
+    n_anchors = len(anchors)
+    n_calls = n_sessions * n_anchors * 2  # supervised + judge per (session, anchor)
+    typer.echo(
+        f"schedule={schedule_path} sessions={n_sessions} "
+        f"anchors={n_anchors} llm_calls~{n_calls}"
+    )
+    for stage in schedule.stages:
+        typer.echo(
+            f"  stage={stage.label:<10} sessions={stage.sessions:>3} "
+            f"suffix={stage.suffix!r}"
+        )
+
+    if dry_run:
+        typer.echo("dry-run: no LLM calls issued.")
+        return
+
+    settings = get_settings()
+    backend = _backend_factory(settings)
+
+    try:
+        drift_run_id, summary = run_drift(
+            schedule,
+            policy=policy,
+            anchors=anchors,
+            supervised_client=backend,  # type: ignore[arg-type]
+            judge_client=backend,  # type: ignore[arg-type]
+            supervised_model=settings.ollama_supervised_model,
+            judge_model=settings.ollama_judge_model,
+            schedule_path=str(schedule_path),
+            replay=replay,
+            run_notes=notes,
+            k_threshold=k_threshold,
+            on_progress=_stream_drift_progress,
+        )
+    except ValueError as exc:
+        typer.echo(f"invalid configuration: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+    except LLMError as exc:
+        typer.echo(f"LLM backend error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    mean_str = (
+        f"{summary.mean_baseline_aggregate:.3f}"
+        if summary.mean_baseline_aggregate is not None
+        else "n/a"
+    )
+    typer.echo(
+        f"drift_run_id={drift_run_id} scored={summary.total_scored} "
+        f"failures={summary.failure_count} mean_baseline_aggregate={mean_str}"
+    )
 
 
 @app.command("fragility-report")

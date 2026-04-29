@@ -1,0 +1,11 @@
+# Tiny drift schedule used by the @pytest.mark.integration test for
+# `maimonedes induce-drift`. Five sessions split across two stages so
+# the test covers both the suffix-empty (baseline) and suffix-set
+# branches of the orchestrator without requiring 50 LLM calls per CI run.
+stages:
+  - label: baseline
+    sessions: 3
+    suffix: ""
+  - label: concise
+    sessions: 2
+    suffix: "Be concise and direct."
