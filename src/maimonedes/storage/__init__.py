@@ -11,4 +11,5 @@ from maimonedes.storage import (  # noqa: F401
     llm_calls,
     models,
     perturbations,
+    recovery,
 )

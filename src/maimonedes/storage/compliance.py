@@ -50,6 +50,9 @@ class ComplianceScoreRow(Base):
     drift_session_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("drift_sessions.id"), nullable=True
     )
+    recovery_run_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("recovery_runs.id"), nullable=True
+    )
     scored_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -77,6 +80,7 @@ def row_to_score(row: ComplianceScoreRow) -> ComplianceScore:
         perturbation_id=row.perturbation_id,
         probe_role=row.probe_role,  # type: ignore[arg-type]
         drift_session_id=row.drift_session_id,
+        recovery_run_id=row.recovery_run_id,
         scored_at=scored_at,
     )
 
@@ -96,6 +100,7 @@ def record_score(score: ComplianceScore) -> int:
             perturbation_id=score.perturbation_id,
             probe_role=score.probe_role,
             drift_session_id=score.drift_session_id,
+            recovery_run_id=score.recovery_run_id,
             scored_at=score.scored_at,
         )
         session.add(row)
@@ -125,6 +130,10 @@ def latest_score_per_anchor() -> dict[str, ComplianceScore]:
     under a contaminated system prompt, with `probe_role = "anchor"` and
     `drift_session_id` set. The Phase 3 dashboard reads via
     `storage.drift.scores_for_run` and bypasses this helper.
+    Phase 4 recovery scores have the same caveat: `probe_role = "anchor"`
+    with `recovery_run_id` set; they will surface as the latest score
+    here, and the Phase 4 dashboard bypasses via
+    `storage.recovery.scores_for_recovery_run`.
     """
     with get_session() as session:
         anchor_ids = session.execute(

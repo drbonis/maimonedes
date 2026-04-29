@@ -42,6 +42,9 @@ class ComplianceScore(BaseModel):
     # Phase 3: anchor scores collected during a synthetic drift run
     # carry the FK to their `drift_session`; non-drift rows leave it None.
     drift_session_id: int | None = None
+    # Phase 4: scores collected during a recovery run carry the FK to
+    # their `recovery_run`; non-recovery rows leave it None.
+    recovery_run_id: int | None = None
     scored_at: datetime = Field(default_factory=_utcnow)
 
 
