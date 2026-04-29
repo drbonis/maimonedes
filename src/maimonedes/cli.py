@@ -47,11 +47,17 @@ from maimonedes.experiments.run_session import run_once as run_once_session
 from maimonedes.llm.client import LLMError, Message
 from maimonedes.llm.ollama_backend import OllamaBackend
 from maimonedes.llm.recording_client import RecordingClient
+from maimonedes.monitor.drift_report import (
+    DriftReport,
+    NoBaselineDataError,
+    build_report,
+)
 from maimonedes.monitor.fragility import (
     aggregated_fragility,
     all_jacobians,
 )
 from maimonedes.settings import Settings, get_settings
+from maimonedes.storage.drift import get_drift_run
 
 PING_PROMPT = "Reply with the single word PONG."
 
@@ -666,6 +672,152 @@ def induce_drift_cmd(
         f"drift_run_id={drift_run_id} scored={summary.total_scored} "
         f"failures={summary.failure_count} mean_baseline_aggregate={mean_str}"
     )
+
+
+def _format_report_table(report: DriftReport) -> list[str]:
+    """Plain-text table — grep-friendly, no rich. Returns lines."""
+    headers = (
+        "anchor",
+        "n_sess",
+        "mean_base",
+        "min_agg",
+        "first_viol",
+        "cusum",
+        "ewma",
+        "lead",
+    )
+    rows: list[tuple[str, ...]] = []
+    for r in report.rows:
+        if r.detector_skipped:
+            mean_base = "n/a"
+            min_agg = "n/a"
+            first_viol = "n/a"
+            cusum = "n/a"
+            ewma = "n/a"
+            lead = "n/a"
+        else:
+            mean_base = (
+                f"{r.mean_baseline:.3f}" if r.mean_baseline is not None else "-"
+            )
+            min_agg = (
+                f"{r.min_aggregate:.3f}" if r.min_aggregate is not None else "-"
+            )
+            first_viol = (
+                str(r.first_violation_session)
+                if r.first_violation_session is not None
+                else "-"
+            )
+            cusum = (
+                str(r.cusum_first_fire) if r.cusum_first_fire is not None else "-"
+            )
+            ewma = (
+                str(r.ewma_first_fire) if r.ewma_first_fire is not None else "-"
+            )
+            lead_v = r.cusum_lead_sessions
+            if lead_v is None:
+                lead = "-"
+            elif lead_v == float("inf"):
+                lead = "+inf"
+            else:
+                lead = f"{lead_v:+.0f}"
+        rows.append(
+            (
+                r.anchor_id,
+                str(r.n_sessions),
+                mean_base,
+                min_agg,
+                first_viol,
+                cusum,
+                ewma,
+                lead,
+            )
+        )
+    widths = [
+        max(len(headers[i]), *(len(row[i]) for row in rows)) if rows else len(headers[i])
+        for i in range(len(headers))
+    ]
+    lines: list[str] = []
+    lines.append(
+        "  ".join(h.ljust(w) for h, w in zip(headers, widths))
+    )
+    lines.append("  ".join("-" * w for w in widths))
+    for row in rows:
+        lines.append("  ".join(c.ljust(w) for c, w in zip(row, widths)))
+    return lines
+
+
+@app.command("drift-report")
+def drift_report_cmd(
+    run_id: int = typer.Argument(..., help="drift_run_id from `induce-drift`."),
+    violation_threshold: float = typer.Option(
+        0.5,
+        "--violation-threshold",
+        help="An aggregate score below this counts as an explicit violation.",
+    ),
+    k: float = typer.Option(
+        4.0, "--k", help="CUSUM threshold tuner constant (h = k·σ)."
+    ),
+    lambda_: float = typer.Option(
+        0.2, "--lambda", help="EWMA smoothing constant."
+    ),
+    L: float = typer.Option(
+        3.0, "--L", help="EWMA control-limit width in baseline σ."
+    ),
+) -> None:
+    """Print detection-latency summary for a drift run."""
+    run = get_drift_run(run_id)
+    if run is None:
+        typer.echo(f"unknown drift_run_id: {run_id}", err=True)
+        raise typer.Exit(code=4)
+
+    persisted_k = run.get("k_threshold")
+    if persisted_k is not None and abs(float(persisted_k) - k) > 1e-9:
+        typer.echo(
+            f"warning: --k={k} differs from run's persisted k_threshold="
+            f"{persisted_k}; computing CUSUM with the override.",
+            err=True,
+        )
+
+    try:
+        report = build_report(
+            run_id,
+            violation_threshold=violation_threshold,
+            k=k,
+            lambda_=lambda_,
+            L=L,
+        )
+    except NoBaselineDataError as exc:
+        typer.echo(f"insufficient baseline data: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    typer.echo(
+        f"drift_run_id={run_id} policy={run['policy_id']} "
+        f"supervised={run['supervised_model']} judge={run['judge_model']}"
+    )
+    for line in _format_report_table(report):
+        typer.echo(line)
+
+    cusum_str = (
+        f"{report.earliest_cusum_fire[0]} @ S{report.earliest_cusum_fire[1]}"
+        if report.earliest_cusum_fire is not None
+        else "no fires"
+    )
+    viol_str = (
+        f"{report.earliest_violation[0]} @ S{report.earliest_violation[1]}"
+        if report.earliest_violation is not None
+        else "no violations"
+    )
+    typer.echo(f"earliest_cusum_fire: {cusum_str}")
+    typer.echo(f"earliest_violation:  {viol_str}")
+    headline = report.headline_lead_sessions
+    if headline is None:
+        verdict = "no detector fired"
+    elif headline == float("inf"):
+        verdict = "CUSUM fired with no explicit violation in this run"
+    else:
+        sign = "+" if headline > 0 else ""
+        verdict = f"lead = {sign}{headline:.0f} sessions (violation - cusum)"
+    typer.echo(f"headline:            {verdict}")
 
 
 @app.command("fragility-report")
