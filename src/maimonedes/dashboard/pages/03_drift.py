@@ -15,13 +15,13 @@ this page body.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from datetime import datetime
 
 import plotly.graph_objects as go
 import streamlit as st
 
 from maimonedes.core.drift import STAGE_LABELS
+from maimonedes.dashboard._drift_snapshots import AnchorTrace, RunSnapshot
 from maimonedes.monitor._baseline import load_run_scalars
 from maimonedes.monitor.cusum import cusum_per_anchor
 from maimonedes.monitor.drift_report import (
@@ -53,19 +53,9 @@ STAGE_COLORS = {
 }
 
 
-@dataclass
-class _RunSnapshot:
-    """Picklable summary used by `@st.cache_data` keys + dropdowns."""
-
-    run_id: int
-    started_at: datetime | None
-    notes: str | None
-    label: str
-
-
 @st.cache_data(ttl=10)
-def _cached_runs() -> list[_RunSnapshot]:
-    snapshots: list[_RunSnapshot] = []
+def _cached_runs() -> list[RunSnapshot]:
+    snapshots: list[RunSnapshot] = []
     for run in list_drift_runs():
         started = run.get("started_at")
         notes = run.get("notes")
@@ -75,7 +65,7 @@ def _cached_runs() -> list[_RunSnapshot]:
         if notes:
             label_parts.append(str(notes))
         snapshots.append(
-            _RunSnapshot(
+            RunSnapshot(
                 run_id=int(run["id"]),  # type: ignore[arg-type]
                 started_at=started if isinstance(started, datetime) else None,
                 notes=str(notes) if notes else None,
@@ -85,40 +75,21 @@ def _cached_runs() -> list[_RunSnapshot]:
     return snapshots
 
 
-@dataclass
-class _AnchorTrace:
-    """All data needed to render one anchor's plot, packaged for caching."""
-
-    anchor_id: str
-    session_indices: list[int]
-    stage_labels: list[str]
-    aggregates: list[float]
-    cusum_values: list[float]
-    cusum_threshold: float
-    cusum_first_fire: int | None
-    ewma_values: list[float]
-    ewma_lcls: list[float]
-    ewma_asymptotic_lcl: float
-    ewma_first_fire: int | None
-    first_violation: int | None
-    detector_skipped: bool
-
-
 @st.cache_data(ttl=10)
-def _cached_traces(run_id: int) -> dict[str, _AnchorTrace]:
+def _cached_traces(run_id: int) -> dict[str, AnchorTrace]:
     """Per-anchor traces. Detector-less anchors carry empty stat lists."""
     streams = load_run_scalars(run_id)
     cusum_traces = cusum_per_anchor(run_id)
     ewma_traces = ewma_per_anchor(run_id)
 
-    out: dict[str, _AnchorTrace] = {}
+    out: dict[str, AnchorTrace] = {}
     for anchor_id, triples in streams.items():
         cusum_states = cusum_traces.get(anchor_id, [])
         ewma_states = ewma_traces.get(anchor_id, [])
         first_violation: int | None = next(
             (idx for (idx, _stage, agg) in triples if agg < 0.5), None
         )
-        out[anchor_id] = _AnchorTrace(
+        out[anchor_id] = AnchorTrace(
             anchor_id=anchor_id,
             session_indices=[idx for (idx, _stage, _agg) in triples],
             stage_labels=[stage for (_idx, stage, _agg) in triples],
@@ -165,7 +136,7 @@ def _stage_band_spans(stage_labels: list[str]) -> list[tuple[str, int, int]]:
     return out
 
 
-def _build_figure(trace: _AnchorTrace) -> go.Figure:
+def _build_figure(trace: AnchorTrace) -> go.Figure:
     fig = go.Figure()
 
     # Stage bands first so subsequent traces sit on top.
@@ -335,7 +306,7 @@ def _row_to_table_dict(row: AnchorReportRow) -> dict[str, object]:
 
 
 def _select_default_anchor(
-    traces: dict[str, _AnchorTrace], options: list[str]
+    traces: dict[str, AnchorTrace], options: list[str]
 ) -> str:
     """Default to the anchor with the earliest CUSUM fire; else lowest min agg."""
     earliest_fire: tuple[str, int] | None = None
