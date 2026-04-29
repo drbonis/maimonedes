@@ -33,6 +33,7 @@ from maimonedes.experiments.calibrate_judge import (
     run_calibration,
 )
 from maimonedes.experiments.perturbation_session import (
+    PARAPHRASE_BACKEND_NAME,
     PerturbationOutcome,
     PerturbationProgress,
     run_perturbations,
@@ -284,6 +285,7 @@ def _build_generators(
     paraphrase_client: object,
     paraphrase_model: str,
     paraphrase_n: int,
+    replay: bool,
     demographic_path: Path,
     authority_path: Path,
     boundary_path: Path,
@@ -293,9 +295,19 @@ def _build_generators(
     out: list[PerturbationGenerator] = []
     for kind in kinds:
         if kind == "paraphrase":
+            # Wrap the paraphrase client in a RecordingClient so its
+            # LLM calls land in `llm_calls` with backend_name
+            # `ollama-paraphrase`, alongside the supervised + judge
+            # rows the orchestrator already records. `replay` is
+            # honoured so re-runs can serve cached rewrites.
+            paraphrase_rc = RecordingClient(
+                paraphrase_client,  # type: ignore[arg-type]
+                backend_name=PARAPHRASE_BACKEND_NAME,
+                replay=replay,
+            )
             out.append(
                 ParaphraseGenerator(
-                    paraphrase_client,  # type: ignore[arg-type]
+                    paraphrase_rc,
                     model=paraphrase_model,
                     n=paraphrase_n,
                 )
@@ -432,6 +444,7 @@ def perturb_cmd(
             paraphrase_client=backend,
             paraphrase_model=settings.ollama_supervised_model,
             paraphrase_n=paraphrase_n,
+            replay=replay,
             demographic_path=demographic_path,
             authority_path=authority_path,
             boundary_path=boundary_path,

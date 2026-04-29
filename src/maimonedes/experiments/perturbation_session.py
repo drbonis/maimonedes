@@ -39,6 +39,12 @@ log = logging.getLogger(__name__)
 
 SUPERVISED_BACKEND_NAME = "ollama-supervised"
 JUDGE_BACKEND_NAME = "ollama-judge"
+# Paraphrase generator's LLM calls are wrapped at construction time
+# (in `cli._build_generators`); this name is used for the
+# `RecordingClient(backend_name=...)` so the audit trail in
+# `llm_calls` separates paraphrase-generation requests from
+# supervised + judge calls.
+PARAPHRASE_BACKEND_NAME = "ollama-paraphrase"
 
 
 @dataclass
@@ -225,6 +231,7 @@ def _run_single(
 __all__ = [
     "GenerationCallback",
     "JUDGE_BACKEND_NAME",
+    "PARAPHRASE_BACKEND_NAME",
     "PerturbationOutcome",
     "PerturbationProgress",
     "ProgressCallback",

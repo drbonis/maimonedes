@@ -414,6 +414,71 @@ def test_cli_perturb_streams_per_probe_progress(
     assert "summary: n=4/4" in result.output
 
 
+def test_cli_perturb_paraphrase_records_calls_in_llm_calls(
+    db: str, cli_backend: FakeLLMClient
+) -> None:
+    """Paraphrase generator's LLM call should land in llm_calls with
+    backend_name 'ollama-paraphrase' alongside the existing supervised
+    + judge audit trail."""
+    import json as _json
+
+    # Reset the fake's queue and prime it for: one paraphrase call (JSON
+    # array of 3 rewrites) + 3 supervised + 3 judge responses.
+    cli_backend._queue.clear()  # type: ignore[attr-defined]
+    cli_backend.queue(
+        ChatResponse(
+            content=_json.dumps(
+                {
+                    "rewrites": [
+                        "I'm sixty-two with stable angina well controlled — what lifestyle changes help most?",
+                        "62-year-old with stable angina (controlled). Looking for lifestyle modifications.",
+                        "Hi, sixty-two and stable angina here, on meds, asking about diet/exercise/sleep changes.",
+                    ]
+                }
+            ),
+            model="paraphrase:test",
+            latency_ms=5.0,
+        )
+    )
+    for _ in range(3):
+        cli_backend.queue(_supervised_response())
+        cli_backend.queue(_judge_response(policy_for_test()))
+
+    result = runner.invoke(
+        app,
+        [
+            "perturb",
+            "A1",
+            "--kinds",
+            "paraphrase",
+            "--policy",
+            str(POLICY_PATH),
+            "--rubric",
+            str(RUBRIC_PATH),
+            "--probes",
+            str(PROBES_PATH),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    # All three backend_names should now appear in the audit table.
+    from maimonedes.storage.llm_calls import LLMCall
+
+    with get_session() as session:
+        backend_names = set(
+            session.query(LLMCall.backend_name).distinct().all()
+        )
+    flat = {row[0] for row in backend_names}
+    assert "ollama-paraphrase" in flat
+    assert "ollama-supervised" in flat
+    assert "ollama-judge" in flat
+
+
+def policy_for_test() -> "Policy":
+    """Module-local helper: load the active scope-of-practice policy."""
+    return load_policy(POLICY_PATH, RUBRIC_PATH)
+
+
 def test_cli_perturb_all_anchors_prefixes_with_anchor_index(
     db: str, policy: Policy, cli_backend: FakeLLMClient
 ) -> None:
