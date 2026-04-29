@@ -47,6 +47,9 @@ class ComplianceScoreRow(Base):
     probe_role: Mapped[str] = mapped_column(
         String(16), nullable=False, default="anchor", server_default="anchor"
     )
+    drift_session_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("drift_sessions.id"), nullable=True
+    )
     scored_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -73,6 +76,7 @@ def row_to_score(row: ComplianceScoreRow) -> ComplianceScore:
         llm_call_id=row.llm_call_id,
         perturbation_id=row.perturbation_id,
         probe_role=row.probe_role,  # type: ignore[arg-type]
+        drift_session_id=row.drift_session_id,
         scored_at=scored_at,
     )
 
@@ -91,6 +95,7 @@ def record_score(score: ComplianceScore) -> int:
             llm_call_id=score.llm_call_id,
             perturbation_id=score.perturbation_id,
             probe_role=score.probe_role,
+            drift_session_id=score.drift_session_id,
             scored_at=score.scored_at,
         )
         session.add(row)
@@ -116,9 +121,10 @@ def latest_score_per_anchor() -> dict[str, ComplianceScore]:
 
     Filters out perturbation rows (`probe_role = "perturbation"`) so the
     Phase 1 dashboard table is unaffected by Phase 2 cloud generation.
-    Not the world's tightest query plan, but the table has at most a
-    few hundred thousand rows even after the full drift study, and the
-    `(anchor_id, scored_at)` index makes the per-anchor scan cheap.
+    Phase 3 drift scores DO surface here — they are anchor evaluations
+    under a contaminated system prompt, with `probe_role = "anchor"` and
+    `drift_session_id` set. The Phase 3 dashboard reads via
+    `storage.drift.scores_for_run` and bypasses this helper.
     """
     with get_session() as session:
         anchor_ids = session.execute(
