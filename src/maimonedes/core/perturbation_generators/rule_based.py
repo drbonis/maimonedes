@@ -1,10 +1,12 @@
 """Rule-based perturbation generators (Phase 2 / #18).
 
-Three deterministic generators sharing a YAML-templated pattern:
+Five deterministic generators sharing a YAML-templated pattern:
 
 - `DemographicGenerator` — token substitution over age and sex
 - `AuthorityGenerator`   — prefix injection
 - `BoundaryGenerator`    — directive-language escalation
+- `EthnicityGenerator`   — patient first-name swaps
+- `ProfessionGenerator`  — patient occupation swaps (SES proxy)
 
 Determinism is the contract: same anchor in → same perturbation list
 out, in the same order, across runs and machines. Generators are
@@ -268,8 +270,113 @@ class BoundaryGenerator:
         return out
 
 
+# ---- Word-bounded swap base ------------------------------------------------
+
+
+class _WordSwapGenerator:
+    """Generators that read a YAML `swaps:` list and emit one
+    perturbation per swap that successfully matches a whole-word
+    occurrence of `from` in the anchor scenario.
+
+    Subclasses override `KIND` (the `PerturbationKind` literal) and
+    `LABEL_PREFIX` (the prefix used in `transform_label`).
+    """
+
+    KIND: str = ""  # overridden
+    LABEL_PREFIX: str = ""  # overridden
+
+    def __init__(self, templates_path: str | Path) -> None:
+        if not self.KIND or not self.LABEL_PREFIX:  # defensive
+            raise RuntimeError(
+                f"{type(self).__name__} must set KIND and LABEL_PREFIX"
+            )
+        data = _load_yaml(templates_path)
+        items = data.get("swaps", [])
+        if not isinstance(items, list) or not items:
+            raise ValueError(
+                f"{templates_path}: `swaps` must be a non-empty list"
+            )
+        clean: list[tuple[str, str, str]] = []
+        ids: set[str] = set()
+        for entry in items:
+            if (
+                not isinstance(entry, dict)
+                or not all(
+                    isinstance(entry.get(k), str) and entry.get(k)
+                    for k in ("id", "from", "to")
+                )
+            ):
+                raise ValueError(
+                    f"{templates_path}: each `swaps` entry must have "
+                    f"non-empty string `id`, `from`, and `to`"
+                )
+            if entry["id"] in ids:
+                raise ValueError(
+                    f"{templates_path}: duplicate swap id {entry['id']!r}"
+                )
+            ids.add(entry["id"])
+            clean.append((entry["id"], entry["from"], entry["to"]))
+        self._swaps = clean
+
+    def generate(self, anchor: AnchorProbe) -> list[PerturbationProbe]:
+        out: list[PerturbationProbe] = []
+        for swap_id, from_word, to_word in self._swaps:
+            pattern = re.compile(rf"\b{re.escape(from_word)}\b")
+            if not pattern.search(anchor.scenario):
+                continue
+            new_scenario = pattern.sub(to_word, anchor.scenario, count=1)
+            label = f"{self.LABEL_PREFIX}:{swap_id}"
+            out.append(
+                _build_probe(
+                    anchor,
+                    perturbation_kind=self.KIND,
+                    transform_label=label,
+                    new_scenario=new_scenario,
+                    metadata={
+                        "swap_id": swap_id,
+                        "from": from_word,
+                        "to": to_word,
+                    },
+                )
+            )
+        return out
+
+
+# ---- Ethnicity (name) ------------------------------------------------------
+
+
+class EthnicityGenerator(_WordSwapGenerator):
+    """Substitutes the patient's first name to test demographic invariance.
+
+    Anchors all use a culturally-neutral default (`John`); each swap
+    emits one perturbation. Compliance scores SHOULD be invariant to
+    these swaps; large Δs on `ethnicity:*` rows in the Jacobian are a
+    signal of demographic bias in the supervised model.
+    """
+
+    KIND = "ethnicity"
+    LABEL_PREFIX = "ethnicity"
+
+
+# ---- Profession (SES) ------------------------------------------------------
+
+
+class ProfessionGenerator(_WordSwapGenerator):
+    """Substitutes the patient's occupation to test SES-conditioned bias.
+
+    Anchors default to `teacher`; swaps span lower- and higher-income
+    occupations. As with ethnicity, compliance should be invariant —
+    large `profession:*` Δs flag SES-conditioned variance.
+    """
+
+    KIND = "profession"
+    LABEL_PREFIX = "profession"
+
+
 __all__ = [
     "AuthorityGenerator",
     "BoundaryGenerator",
     "DemographicGenerator",
+    "EthnicityGenerator",
+    "ProfessionGenerator",
 ]

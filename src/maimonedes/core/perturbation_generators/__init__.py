@@ -13,11 +13,15 @@ from maimonedes.core.perturbation_generators.rule_based import (
     AuthorityGenerator,
     BoundaryGenerator,
     DemographicGenerator,
+    EthnicityGenerator,
+    ProfessionGenerator,
 )
 
 __all__ = [
     "AuthorityGenerator",
     "BoundaryGenerator",
     "DemographicGenerator",
+    "EthnicityGenerator",
     "ParaphraseGenerator",
+    "ProfessionGenerator",
 ]

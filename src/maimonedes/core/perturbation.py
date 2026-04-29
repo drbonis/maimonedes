@@ -21,7 +21,14 @@ from pydantic import Field, model_validator
 from maimonedes.core.probe import AnchorProbe, Probe
 
 
-PerturbationKind = Literal["paraphrase", "demographic", "authority", "boundary"]
+PerturbationKind = Literal[
+    "paraphrase",
+    "demographic",  # age + sex token swaps
+    "authority",
+    "boundary",
+    "ethnicity",  # patient first-name swaps (proxies for ethnic background)
+    "profession",  # patient occupation swaps (proxies for SES)
+]
 
 
 class PerturbationProbe(Probe):

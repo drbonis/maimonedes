@@ -22,7 +22,9 @@ from maimonedes.core.perturbation_generators import (
     AuthorityGenerator,
     BoundaryGenerator,
     DemographicGenerator,
+    EthnicityGenerator,
     ParaphraseGenerator,
+    ProfessionGenerator,
 )
 from maimonedes.core.policy import load_policy
 from maimonedes.core.probe import load_anchors
@@ -57,7 +59,16 @@ DEFAULT_REPORTS_DIR = Path("reports")
 DEFAULT_DEMOGRAPHIC_PATH = Path("config/perturbations/demographic_v1.yaml")
 DEFAULT_AUTHORITY_PATH = Path("config/perturbations/authority_v1.yaml")
 DEFAULT_BOUNDARY_PATH = Path("config/perturbations/boundary_v1.yaml")
-ALL_KINDS = ("paraphrase", "demographic", "authority", "boundary")
+DEFAULT_ETHNICITY_PATH = Path("config/perturbations/ethnicity_v1.yaml")
+DEFAULT_PROFESSION_PATH = Path("config/perturbations/profession_v1.yaml")
+ALL_KINDS = (
+    "paraphrase",
+    "demographic",
+    "authority",
+    "boundary",
+    "ethnicity",
+    "profession",
+)
 
 app = typer.Typer(
     add_completion=False,
@@ -276,6 +287,8 @@ def _build_generators(
     demographic_path: Path,
     authority_path: Path,
     boundary_path: Path,
+    ethnicity_path: Path,
+    profession_path: Path,
 ) -> list[PerturbationGenerator]:
     out: list[PerturbationGenerator] = []
     for kind in kinds:
@@ -293,6 +306,10 @@ def _build_generators(
             out.append(AuthorityGenerator(authority_path))
         elif kind == "boundary":
             out.append(BoundaryGenerator(boundary_path))
+        elif kind == "ethnicity":
+            out.append(EthnicityGenerator(ethnicity_path))
+        elif kind == "profession":
+            out.append(ProfessionGenerator(profession_path))
         else:
             raise typer.BadParameter(
                 f"unknown perturbation kind: {kind!r}; "
@@ -387,6 +404,12 @@ def perturb_cmd(
     boundary_path: Path = typer.Option(
         DEFAULT_BOUNDARY_PATH, "--boundary-path"
     ),
+    ethnicity_path: Path = typer.Option(
+        DEFAULT_ETHNICITY_PATH, "--ethnicity-path"
+    ),
+    profession_path: Path = typer.Option(
+        DEFAULT_PROFESSION_PATH, "--profession-path"
+    ),
 ) -> None:
     """Generate, run, and score a perturbation cloud for one anchor (or all)."""
     if not all_anchors and anchor_id is None:
@@ -412,6 +435,8 @@ def perturb_cmd(
             demographic_path=demographic_path,
             authority_path=authority_path,
             boundary_path=boundary_path,
+            ethnicity_path=ethnicity_path,
+            profession_path=profession_path,
         )
     except FileNotFoundError as exc:
         typer.echo(f"config file not found: {exc}", err=True)
