@@ -33,6 +33,10 @@ from maimonedes.experiments.calibrate_judge import (
     load_references,
     run_calibration,
 )
+from maimonedes.experiments.apply_feedback import (
+    RecoveryProgress,
+    apply_feedback,
+)
 from maimonedes.experiments.induce_drift import (
     DriftSessionProgress,
     run_drift,
@@ -56,6 +60,8 @@ from maimonedes.monitor.fragility import (
     aggregated_fragility,
     all_jacobians,
 )
+from maimonedes.monitor.localizer import localize
+from maimonedes.feedback.contrastive import fragility_pair, temporal_pair
 from maimonedes.settings import Settings, get_settings
 from maimonedes.storage.drift import get_drift_run
 
@@ -818,6 +824,163 @@ def drift_report_cmd(
         sign = "+" if headline > 0 else ""
         verdict = f"lead = {sign}{headline:.0f} sessions (violation - cusum)"
     typer.echo(f"headline:            {verdict}")
+
+
+def _stream_recovery_progress(progress: RecoveryProgress) -> None:
+    """`A3 evaluate  pre=0.42 post=0.81` — one line per (anchor, step)."""
+    typer.echo(f"  {progress.anchor_id} {progress.step}  {progress.detail}")
+
+
+@app.command("apply-feedback")
+def apply_feedback_cmd(
+    drift_run_id: int = typer.Argument(..., help="Parent drift_run_id."),
+    contrastive_kind: str = typer.Option(
+        "temporal",
+        "--kind",
+        help="Contrastive scenario: temporal | fragility.",
+    ),
+    anchors_arg: str | None = typer.Option(
+        None,
+        "--anchors",
+        help="Comma-separated anchor ids — overrides the localizer's "
+        "automatic top-k pick.",
+    ),
+    top_k: int = typer.Option(
+        3,
+        "--top-k",
+        help="Number of worst-affected anchors to recover (ignored when "
+        "--anchors is set).",
+    ),
+    policy_path: Path = typer.Option(DEFAULT_POLICY_PATH, "--policy"),
+    rubric_path: Path = typer.Option(DEFAULT_RUBRIC_PATH, "--rubric"),
+    probes_path: Path = typer.Option(DEFAULT_PROBES_PATH, "--probes"),
+    replay: bool = typer.Option(
+        False,
+        "--replay",
+        help="Use the RecordingClient replay cache for supervised, judge, "
+        "and synthesizer calls.",
+    ),
+    notes: str | None = typer.Option(
+        None, "--notes", help="Free-form note stored on the recovery_run row."
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print the affected anchors and the contrastive pair shapes "
+        "without making any LLM calls.",
+    ),
+) -> None:
+    """Localize, synthesize feedback, and re-run anchors to close the loop."""
+    if contrastive_kind not in ("temporal", "fragility"):
+        raise typer.BadParameter(
+            f"--kind must be 'temporal' or 'fragility', got {contrastive_kind!r}"
+        )
+    if top_k < 1:
+        raise typer.BadParameter("--top-k must be >= 1")
+
+    try:
+        policy = load_policy(policy_path, rubric_path)
+        anchors = load_anchors(probes_path)
+    except FileNotFoundError as exc:
+        typer.echo(f"config file not found: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+    except (ValueError, KeyError) as exc:
+        typer.echo(f"invalid configuration: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+
+    parent = get_drift_run(drift_run_id)
+    if parent is None:
+        typer.echo(f"unknown drift_run_id: {drift_run_id}", err=True)
+        raise typer.Exit(code=4)
+
+    selected_ids: list[str] | None = None
+    if anchors_arg:
+        selected_ids = [a.strip() for a in anchors_arg.split(",") if a.strip()]
+
+    localizations = localize(
+        drift_run_id,
+        policy=policy,
+        top_k=top_k if selected_ids is None else None,
+    )
+    if selected_ids is not None:
+        wanted = set(selected_ids)
+        localizations = [r for r in localizations if r.anchor_id in wanted]
+        missing = wanted - {r.anchor_id for r in localizations}
+        if missing:
+            typer.echo(f"unknown anchor ids: {sorted(missing)}", err=True)
+            raise typer.Exit(code=4)
+
+    if not localizations:
+        typer.echo(
+            f"no affected anchors found in drift_run {drift_run_id}; "
+            f"is the run empty?",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    typer.echo(
+        f"parent_drift_run={drift_run_id} kind={contrastive_kind} "
+        f"anchors={len(localizations)}"
+    )
+    for r in localizations:
+        typer.echo(
+            f"  {r.anchor_id} distance={r.distance:.3f} "
+            f"worst_aggregate={r.worst_score.aggregate:.3f}"
+        )
+
+    if dry_run:
+        for r in localizations:
+            if contrastive_kind == "temporal":
+                pair = temporal_pair(r.anchor_id, drift_run_id=drift_run_id)
+            else:
+                pair = fragility_pair(r.anchor_id, policy=policy)
+            if pair is None:
+                typer.echo(f"  {r.anchor_id} pair=NONE")
+            else:
+                typer.echo(
+                    f"  {r.anchor_id} pair=ok safe_agg="
+                    f"{pair.safe_score.aggregate:.3f} "
+                    f"near_agg={pair.near_boundary_score.aggregate:.3f}"
+                )
+        typer.echo("dry-run: no LLM calls issued.")
+        return
+
+    settings = get_settings()
+    backend = _backend_factory(settings)
+
+    try:
+        recovery_run_id, summary = apply_feedback(
+            drift_run_id,
+            policy=policy,
+            anchors=anchors,
+            supervised_client=backend,  # type: ignore[arg-type]
+            judge_client=backend,  # type: ignore[arg-type]
+            supervised_model=settings.ollama_supervised_model,
+            judge_model=settings.ollama_judge_model,
+            contrastive_kind=contrastive_kind,  # type: ignore[arg-type]
+            top_k=top_k,
+            selected_anchor_ids=selected_ids,
+            replay=replay,
+            run_notes=notes,
+            on_progress=_stream_recovery_progress,
+        )
+    except ValueError as exc:
+        typer.echo(f"invalid configuration: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+    except LLMError as exc:
+        typer.echo(f"LLM backend error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    delta_str = (
+        f"{summary.mean_delta_toward_baseline:+.3f}"
+        if summary.mean_delta_toward_baseline is not None
+        else "n/a"
+    )
+    typer.echo(
+        f"recovery_run_id={recovery_run_id} anchors={summary.anchor_count} "
+        f"failures={summary.failure_count} "
+        f"mean_delta_toward_baseline={delta_str}"
+    )
 
 
 @app.command("fragility-report")
