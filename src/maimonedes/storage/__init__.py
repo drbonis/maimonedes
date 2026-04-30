@@ -8,6 +8,7 @@ caller imports first.
 from maimonedes.storage import (  # noqa: F401
     compliance,
     drift,
+    embed_calls,
     llm_calls,
     models,
     perturbations,

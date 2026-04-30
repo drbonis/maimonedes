@@ -187,6 +187,62 @@ def ping(
         raise typer.Exit(code=3) from exc
 
 
+# Indirection so tests can swap in a FakeEmbedClient without HTTP.
+def _default_embed_factory(settings: Settings) -> object:
+    from maimonedes.llm.clinicalbert_backend import ClinicalBertBackend
+
+    return ClinicalBertBackend(
+        base_url=settings.clinicalbert_base_url,
+        model=settings.clinicalbert_model,
+        request_timeout_s=settings.clinicalbert_request_timeout_s,
+        max_retries=settings.clinicalbert_max_retries,
+    )
+
+
+_embed_factory: Callable[[Settings], object] = _default_embed_factory
+
+
+def set_embed_factory(factory: Callable[[Settings], object]) -> None:
+    """Test hook: override the embed-backend constructor."""
+    global _embed_factory
+    _embed_factory = factory
+
+
+def reset_embed_factory() -> None:
+    global _embed_factory
+    _embed_factory = _default_embed_factory
+
+
+@app.command("embed-ping")
+def embed_ping(
+    text: str = typer.Option(
+        "Patient has a history of hypertension.",
+        "--text",
+        help="Sample text to embed.",
+    ),
+) -> None:
+    """Smoke-test the Bio_ClinicalBERT embedding service."""
+    from maimonedes.llm.recording_embed_client import RecordingEmbedClient
+
+    settings = get_settings()
+    backend = _embed_factory(settings)
+    rc = RecordingEmbedClient(backend, backend_name="clinicalbert")  # type: ignore[arg-type]
+    try:
+        response = rc.embed(text, model=settings.clinicalbert_model)
+    except LLMError as exc:
+        typer.echo(f"embed backend error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    except Exception as exc:
+        typer.echo(f"embed-ping failed: {exc}", err=True)
+        raise typer.Exit(code=3) from exc
+
+    preview = ", ".join(f"{v:+.4f}" for v in response.embedding[:5])
+    typer.echo(f"model={response.model}")
+    typer.echo(f"dim={len(response.embedding)}")
+    typer.echo(f"first_5=[{preview}]")
+    typer.echo(f"latency_ms={response.latency_ms:.1f}")
+
+
 @app.command("run-once")
 def run_once_cmd(
     anchor_id: str = typer.Argument(..., help="Anchor id, e.g. A3."),

@@ -1,3 +1,4 @@
+from tests.fakes.fake_embed import EmbedCallRecord, FakeEmbedClient
 from tests.fakes.fake_llm import FakeLLMClient
 from tests.fakes.judge_payloads import (
     compliant_response_json,
@@ -10,6 +11,8 @@ from tests.fakes.judge_payloads import (
 )
 
 __all__ = [
+    "EmbedCallRecord",
+    "FakeEmbedClient",
     "FakeLLMClient",
     "compliant_response_json",
     "least_compliant_value",

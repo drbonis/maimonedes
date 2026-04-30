@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     ollama_supervised_model: str = "llama3.1:8b-instruct-q4_K_M"
     ollama_judge_model: str = "medgemma1.5:4b-it-q4_K_M"
 
+    # Bio_ClinicalBERT embedding service (#36).
+    clinicalbert_base_url: str = "http://192.168.1.30:8000"
+    clinicalbert_model: str = "bio_clinicalbert"
+    clinicalbert_request_timeout_s: float = 30.0
+    clinicalbert_max_retries: int = 3
+
 
 def get_settings() -> Settings:
     return Settings()
