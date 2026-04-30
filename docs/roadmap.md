@@ -245,10 +245,4 @@ Each anchor × ~10 perturbations (4 types) = ~88 probes total. Each probe sessio
 | LAN flakiness between dev and GPU laptop | Low | Retry with exponential backoff in `OpenAIBackend`; explicit timeouts. |
 | Scope creep into v2 mathematics | High | Phase 5 is explicitly fenced. The Riemannian/GP work must not block Phase 4 completion. |
 
----
 
-## Open questions before implementation starts
-
-1. **Hybrid mode as default for v1?** External-API judge + local supervised system, with fully-local as a secondary configuration.
-2. **Single-policy v1?** Scope-of-practice only; epistemic calibration and demographic invariance deferred.
-3. **llama.cpp over Ollama on the GPU laptop?** Equivalent from the client side; llama.cpp gives more direct VRAM control.
