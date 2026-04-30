@@ -117,9 +117,22 @@ def _fetch_training_points(
 
 
 def _default_kernel() -> Kernel:
-    return ConstantKernel(1.0, (1e-3, 1e3)) * RBF(
+    # Constant bound up to 1e6 because earlier fits without alpha
+    # absorbed all the observation noise into the constant and pinned
+    # at 1e3. With alpha now nonzero this is mostly defensive.
+    return ConstantKernel(1.0, (1e-3, 1e6)) * RBF(
         length_scale=1.0, length_scale_bounds=(0.1, 10.0)
     )
+
+
+# sklearn's default `alpha=1e-10` assumes near-perfect observations.
+# Real compliance_scores have substantial duplicate-text rows
+# (anchors scored repeatedly across run-once / drift / recovery)
+# producing different aggregates due to judge noise. With alpha=1e-2
+# the GP attributes that variance to observation noise instead of
+# trying to fit it through the kernel — kernel matrix stays well-
+# conditioned and the optimizer converges without hitting bounds.
+DEFAULT_ALPHA = 1e-2
 
 
 def fit_compliance_gp(
@@ -131,6 +144,7 @@ def fit_compliance_gp(
     min_samples: int = 20,
     library_anchor_texts: dict[str, str] | None = None,
     n_restarts_optimizer: int = 5,
+    alpha: float = DEFAULT_ALPHA,
 ) -> ComplianceGP:
     """Pull (text, aggregate) pairs, embed, fit, return ComplianceGP.
 
@@ -168,6 +182,7 @@ def fit_compliance_gp(
         kernel=kernel or _default_kernel(),
         normalize_y=True,
         n_restarts_optimizer=n_restarts_optimizer,
+        alpha=alpha,
         random_state=0,
     )
     gp.fit(X_scaled, y)
