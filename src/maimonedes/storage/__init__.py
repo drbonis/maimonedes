@@ -6,6 +6,7 @@ its target inside `Base.metadata` regardless of which module the
 caller imports first.
 """
 from maimonedes.storage import (  # noqa: F401
+    audit_runs,
     compliance,
     drift,
     embed_calls,

@@ -348,6 +348,210 @@ def train_stage2_cmd(
         raise typer.Exit(code=6)
 
 
+@app.command("score-stage2")
+def score_stage2_cmd(
+    anchor_id: str = typer.Argument(..., help="Anchor id, e.g. A3."),
+    model_id: int | None = typer.Option(
+        None,
+        "--model",
+        help="stage2_models.id to use. Defaults to the latest model for the policy.",
+    ),
+    text: str | None = typer.Option(
+        None,
+        "--text",
+        help="Override the supervised output text (default: live supervised call).",
+    ),
+    policy_path: Path = typer.Option(DEFAULT_POLICY_PATH, "--policy"),
+    rubric_path: Path = typer.Option(DEFAULT_RUBRIC_PATH, "--rubric"),
+    probes_path: Path = typer.Option(DEFAULT_PROBES_PATH, "--probes"),
+    persist: bool = typer.Option(
+        False,
+        "--persist",
+        help="Persist the score row (probe_role=anchor, judge_model=stage2:<path>).",
+    ),
+) -> None:
+    """Run Stage-2 inference on a supervised output for one anchor."""
+    from maimonedes.core.probe import get_anchor_by_id
+    from maimonedes.llm.recording_embed_client import RecordingEmbedClient
+    from maimonedes.models.stage2 import Stage2Model
+    from maimonedes.scorer.stage2 import Stage2Scorer
+    from maimonedes.storage.compliance import record_score
+    from maimonedes.storage.stage2_models import (
+        get_stage2_model,
+        latest_stage2_model_row,
+    )
+
+    try:
+        policy = load_policy(policy_path, rubric_path)
+        anchors = load_anchors(probes_path)
+    except FileNotFoundError as exc:
+        typer.echo(f"config file not found: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+    except (ValueError, KeyError) as exc:
+        typer.echo(f"invalid configuration: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+
+    if model_id is not None:
+        model_row = get_stage2_model(model_id)
+        if model_row is None:
+            typer.echo(f"unknown stage2 model: {model_id}", err=True)
+            raise typer.Exit(code=4)
+    else:
+        model_row = latest_stage2_model_row(policy.id)
+        if model_row is None:
+            typer.echo(
+                f"no Stage-2 model found for policy {policy.id!r}; "
+                f"run `maimonedes train-stage2` first",
+                err=True,
+            )
+            raise typer.Exit(code=4)
+
+    try:
+        stage2 = Stage2Model.load(model_row.path)
+    except (ValueError, FileNotFoundError) as exc:
+        typer.echo(f"failed to load stage2 model: {exc}", err=True)
+        raise typer.Exit(code=4) from exc
+
+    settings = get_settings()
+    embed_backend = _embed_factory(settings)
+    rc = RecordingEmbedClient(embed_backend, backend_name="clinicalbert")  # type: ignore[arg-type]
+    scorer = Stage2Scorer(stage2, rc, policy, model_path=model_row.path)
+    anchor = get_anchor_by_id(list(anchors), anchor_id)
+
+    if text is None:
+        backend = _backend_factory(settings)
+        supervised_rc = RecordingClient(
+            backend,  # type: ignore[arg-type]
+            backend_name="ollama-supervised",
+            replay=False,
+        )
+        try:
+            response = supervised_rc.chat_completion(
+                [Message(role="user", content=anchor.scenario)],
+                model=settings.ollama_supervised_model,
+                temperature=0.0,
+            )
+        except LLMError as exc:
+            typer.echo(f"supervised LLM error: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
+        text = response.content
+
+    score = scorer.score(
+        anchor, text, supervised_model=settings.ollama_supervised_model
+    )
+    if persist:
+        record_score(score)
+
+    typer.echo(f"anchor={score.anchor_id}")
+    typer.echo(f"judge_model={score.judge_model}")
+    typer.echo(f"aggregate={score.aggregate:.3f}")
+    for sub_id in sorted(score.per_sub_condition):
+        typer.echo(f"  {sub_id} = {score.per_sub_condition[sub_id]:.3f}")
+
+
+@app.command("audit-stage2")
+def audit_stage2_cmd(
+    model_id: int = typer.Argument(..., help="stage2_models.id to audit."),
+    limit: int = typer.Option(
+        20, "--limit", help="Max rows to re-route through Stage-1."
+    ),
+    policy_path: Path = typer.Option(DEFAULT_POLICY_PATH, "--policy"),
+    rubric_path: Path = typer.Option(DEFAULT_RUBRIC_PATH, "--rubric"),
+    probes_path: Path = typer.Option(DEFAULT_PROBES_PATH, "--probes"),
+    n_scores: int = typer.Option(
+        10, "--n-scores", help="N-scores trigger threshold."
+    ),
+    hours: float = typer.Option(
+        24.0, "--hours", help="K-hours trigger threshold."
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Skip the should_audit gate; always run.",
+    ),
+) -> None:
+    """Force or trigger-gated Stage-1 audit of a Stage-2 model."""
+    from datetime import datetime, timezone
+
+    from maimonedes.models.stage2 import Stage2Model
+    from maimonedes.monitor.stage2_audit import Stage2AuditDetector
+    from maimonedes.storage.stage2_models import get_stage2_model
+
+    try:
+        policy = load_policy(policy_path, rubric_path)
+        anchors = load_anchors(probes_path)
+    except FileNotFoundError as exc:
+        typer.echo(f"config file not found: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+    except (ValueError, KeyError) as exc:
+        typer.echo(f"invalid configuration: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+
+    model_row = get_stage2_model(model_id)
+    if model_row is None:
+        typer.echo(f"unknown stage2 model: {model_id}", err=True)
+        raise typer.Exit(code=4)
+
+    try:
+        stage2 = Stage2Model.load(model_row.path)
+    except (ValueError, FileNotFoundError) as exc:
+        typer.echo(f"failed to load stage2 model: {exc}", err=True)
+        raise typer.Exit(code=4) from exc
+
+    settings = get_settings()
+    backend = _backend_factory(settings)
+
+    detector = Stage2AuditDetector(
+        stage2_model_id=model_id, n_scores=n_scores, hours=hours
+    )
+    last_ended = detector.last_audit_ended_at()
+    model_tag = f"stage2:{Path(model_row.path).name}"
+    rows = detector.scores_since_last(model_tag, last_ended)[:limit]
+
+    if not force:
+        should, reason = detector.should_audit(
+            now=datetime.now(timezone.utc),
+            scores_since_last=len(rows),
+            last_ended_at=last_ended,
+        )
+        if not should:
+            typer.echo(
+                f"audit skipped: trigger={reason} "
+                f"(scores_since_last={len(rows)}, last_ended_at={last_ended})"
+            )
+            return
+        trigger_reason = reason
+    else:
+        trigger_reason = "force"
+
+    if not rows:
+        typer.echo(
+            "no scoreable Stage-2 rows since last audit; nothing to audit",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    report = detector.run_audit(
+        stage2_model=stage2,
+        policy=policy,
+        anchors=anchors,
+        judge_client=backend,  # type: ignore[arg-type]
+        judge_model=settings.ollama_judge_model,
+        supervised_model=settings.ollama_supervised_model,
+        score_rows=rows,
+        trigger_reason=trigger_reason,
+    )
+    typer.echo(
+        f"audit_run_id={report.audit_run_id} stage2_model_id={report.stage2_model_id} "
+        f"trigger={report.trigger_reason} n={report.n_samples} "
+        f"agreement_status={report.agreement_status}"
+    )
+    for m in report.metrics:
+        typer.echo(
+            f"  axis={m.sub_id:<46} mae={m.mae:.3f} spearman_rho={m.spearman_rho:+.3f}"
+        )
+
+
 @app.command("run-once")
 def run_once_cmd(
     anchor_id: str = typer.Argument(..., help="Anchor id, e.g. A3."),
