@@ -101,7 +101,20 @@ class GPTarget:
     embedding: list[float]
     expected_score: float  # GP posterior mean at this point
     uncertainty: float  # GP posterior std at this point
-    score: float  # uncertainty × |0.5 − expected_score|
+    score: float  # uncertainty × max(0, 1 − 2·|0.5 − expected_score|)
+
+
+def _boundary_seeking_score(
+    uncertainty: np.ndarray, mean: np.ndarray
+) -> np.ndarray:
+    """Per-candidate score: peaks at mean=0.5 (boundary), falls to 0 at extremes.
+
+    `uncertainty × max(0, 1 − 2·|0.5 − mean|)` weights uncertain candidates
+    near the violation boundary (where being wrong about safety matters) above
+    equally-uncertain candidates deep in compliant or violation territory.
+    """
+    boundary_weight = np.maximum(0.0, 1.0 - 2.0 * np.abs(0.5 - mean))
+    return uncertainty * boundary_weight
 
 
 def _fetch_training_points(
@@ -246,6 +259,46 @@ def fit_compliance_gp(
     )
 
 
+def _stratified_seed_indices(
+    aggregates: np.ndarray,
+    *,
+    n_candidates: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Sample `n_candidates` training-row indices stratified by score quartile.
+
+    Compliance distributions are typically skewed toward compliance —
+    uniform sampling oversamples high-score regions and starves the
+    boundary. Quartile stratification forces equal candidate share in
+    each quartile, so perturbations of low-score training points get
+    represented in the candidate pool.
+
+    Falls back to uniform sampling when training data has fewer than
+    four distinct score levels (the bucketization would degenerate).
+    """
+    n_train = aggregates.shape[0]
+    if n_train < 4:
+        return rng.integers(0, n_train, size=n_candidates)
+    qs = np.quantile(aggregates, [0.25, 0.5, 0.75])
+    buckets = [
+        np.where(aggregates <= qs[0])[0],
+        np.where((aggregates > qs[0]) & (aggregates <= qs[1]))[0],
+        np.where((aggregates > qs[1]) & (aggregates <= qs[2]))[0],
+        np.where(aggregates > qs[2])[0],
+    ]
+    buckets = [b for b in buckets if len(b) > 0]
+    if len(buckets) <= 1:
+        # All scores collapse into one quartile — fall back to uniform.
+        return rng.integers(0, n_train, size=n_candidates)
+    per_bucket = n_candidates // len(buckets)
+    remainder = n_candidates - per_bucket * len(buckets)
+    chunks: list[np.ndarray] = []
+    for i, bucket in enumerate(buckets):
+        n_for_bucket = per_bucket + (1 if i < remainder else 0)
+        chunks.append(rng.choice(bucket, size=n_for_bucket, replace=True))
+    return np.concatenate(chunks)
+
+
 def propose_targets(
     gp: ComplianceGP,
     *,
@@ -253,18 +306,23 @@ def propose_targets(
     candidate_pool_size: int = 1000,
     seed: int = 0,
     perturbation_sigma: float | None = None,
+    stratify_by_score: bool = True,
 ) -> list[GPTarget]:
-    """Propose top-K embedding-space targets ranked by uncertainty × boundary risk.
+    """Propose top-K embedding-space targets ranked by uncertainty × boundary weight.
 
     Candidates are perturbed in the GP's NATIVE input space (scaled,
     optionally PCA-projected) so the noise actually reaches the GP's
-    posterior. Top-K are then inverse-transformed back to raw
-    768-dim Bio_ClinicalBERT space before being returned, so the
-    synthesizer (#42) and dashboard receive embeddings in the same
-    coordinate system as the library anchors.
+    posterior. Seeds are sampled by score-quartile stratification by
+    default (equal candidate share from each quartile of training
+    aggregates) so a compliance-skewed distribution doesn't starve
+    the boundary. Top-K are inverse-transformed back to raw 768-dim
+    Bio_ClinicalBERT space before being returned, so the synthesizer
+    (#42) and dashboard receive embeddings in the same coordinate
+    system as the library anchors.
 
     `perturbation_sigma` overrides the kernel's length-scale-derived
     perturbation magnitude when set — useful for sweeps.
+    `stratify_by_score=False` reverts to uniform-random seeding.
     """
     rng = np.random.default_rng(seed)
     if gp.training_embeddings.size == 0:
@@ -287,7 +345,12 @@ def propose_targets(
         sigma = float(perturbation_sigma)
 
     n_candidates = max(1, candidate_pool_size)
-    seed_indices = rng.integers(0, n_train, size=n_candidates)
+    if stratify_by_score:
+        seed_indices = _stratified_seed_indices(
+            gp.training_aggregates, n_candidates=n_candidates, rng=rng
+        )
+    else:
+        seed_indices = rng.integers(0, n_train, size=n_candidates)
     seeds = seeds_gp_space[seed_indices]
     noise = rng.normal(0.0, sigma, size=seeds.shape)
     candidates_gp = seeds + noise
@@ -295,8 +358,7 @@ def propose_targets(
     # Predict directly on GP-space candidates (skipping `gp.predict`
     # which would re-transform them).
     mean, std = gp.gp.predict(candidates_gp, return_std=True)
-    risk = np.abs(0.5 - mean)
-    score = std * risk
+    score = _boundary_seeking_score(std, mean)
 
     order = np.argsort(-score, kind="stable")
     top_idx = order[:n_targets]

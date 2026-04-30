@@ -236,9 +236,14 @@ def test_propose_targets_returns_empty_for_unfit_gp(
     assert propose_targets(gp, n_targets=5) == []
 
 
-def test_propose_targets_score_equals_uncertainty_times_boundary_risk(
+def test_propose_targets_score_is_boundary_seeking(
     db: str, policy: Policy
 ) -> None:
+    """score = uncertainty × max(0, 1 − 2·|0.5 − mean|).
+
+    Peaks at mean=0.5 (the violation boundary), falls linearly to 0 at
+    mean=0 or mean=1.
+    """
     _seed_training_pairs(policy)
     fake_embed = FakeEmbedClient(default_dim=8)
     gp = fit_compliance_gp(
@@ -249,8 +254,106 @@ def test_propose_targets_score_equals_uncertainty_times_boundary_risk(
     )
     targets = propose_targets(gp, n_targets=3, candidate_pool_size=50, seed=42)
     for t in targets:
-        expected = t.uncertainty * abs(0.5 - t.expected_score)
-        assert t.score == pytest.approx(expected, rel=1e-6)
+        boundary_weight = max(0.0, 1.0 - 2.0 * abs(0.5 - t.expected_score))
+        expected = t.uncertainty * boundary_weight
+        assert t.score == pytest.approx(expected, rel=1e-6, abs=1e-9)
+
+
+def test_boundary_seeking_score_peaks_at_half() -> None:
+    from maimonedes.monitor.gp_layer import _boundary_seeking_score
+
+    import numpy as np
+
+    means = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+    uncertainty = np.full_like(means, 0.1)
+    scores = _boundary_seeking_score(uncertainty, means)
+    # Peak at mean=0.5 (full weight), linearly decreasing to 0 at extremes.
+    assert scores[2] == pytest.approx(0.1, abs=1e-9)
+    assert scores[1] == pytest.approx(0.05, abs=1e-9)
+    assert scores[3] == pytest.approx(0.05, abs=1e-9)
+    assert scores[0] == pytest.approx(0.0, abs=1e-9)
+    assert scores[4] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_stratified_seeding_distributes_across_quartiles(
+    db: str, policy: Policy
+) -> None:
+    """A continuous score distribution skewed toward compliance: stratified
+    seeding boosts the under-represented low-quartile share above the
+    uniform-sampling baseline."""
+    from maimonedes.monitor.gp_layer import _stratified_seed_indices
+
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    # 100 training points: 10 in [0.1, 0.4], 90 in [0.6, 0.99] — continuous skew.
+    aggregates = np.concatenate(
+        [
+            np.linspace(0.1, 0.4, 10),
+            np.linspace(0.6, 0.99, 90),
+        ]
+    )
+    q25 = float(np.quantile(aggregates, 0.25))
+    indices = _stratified_seed_indices(aggregates, n_candidates=200, rng=rng)
+    sampled_scores = aggregates[indices]
+    n_low_stratified = int(np.sum(sampled_scores <= q25))
+    # 25% of n_candidates is the floor for the bottom quartile under stratified.
+    assert n_low_stratified >= 50  # ~50/200 = 25%, with some slack
+    # Compare against uniform sampling — stratified gives strictly more
+    # low-quartile representation when the distribution is skewed up.
+    uniform_indices = rng.integers(0, len(aggregates), size=200)
+    n_low_uniform = int(np.sum(aggregates[uniform_indices] <= q25))
+    assert n_low_stratified >= n_low_uniform
+
+
+def test_stratified_seeding_falls_back_to_uniform_when_few_unique_scores(
+    db: str,
+) -> None:
+    from maimonedes.monitor.gp_layer import _stratified_seed_indices
+
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    # All training scores identical → only one bucket → fall back to uniform.
+    aggregates = np.full(100, 0.5)
+    indices = _stratified_seed_indices(aggregates, n_candidates=20, rng=rng)
+    assert len(indices) == 20
+    assert indices.min() >= 0
+    assert indices.max() < 100
+
+
+def test_propose_targets_stratify_flag_affects_seeding(
+    db: str, policy: Policy
+) -> None:
+    """With stratify=False the candidate distribution mirrors the training
+    score distribution (uniform sampling); with stratify=True it does not."""
+    _seed_training_pairs(policy, n_per_anchor=20)
+    fake_embed = FakeEmbedClient(default_dim=8)
+    gp = fit_compliance_gp(
+        embed_client=fake_embed,
+        policy=policy,
+        embedding_model="fake-embed",
+        min_samples=10,
+    )
+    # Same seed, same pool size — only stratification differs.
+    uniform = propose_targets(
+        gp,
+        n_targets=10,
+        candidate_pool_size=50,
+        seed=0,
+        stratify_by_score=False,
+    )
+    stratified = propose_targets(
+        gp,
+        n_targets=10,
+        candidate_pool_size=50,
+        seed=0,
+        stratify_by_score=True,
+    )
+    # Different proposal sets → seeding strategy is doing something.
+    uniform_embeds = {tuple(t.embedding) for t in uniform}
+    stratified_embeds = {tuple(t.embedding) for t in stratified}
+    assert uniform_embeds != stratified_embeds
 
 
 # ---- registry --------------------------------------------------------------
