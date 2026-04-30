@@ -7,6 +7,7 @@ lives in:
 - pages/01_compliance_scores.py  — Phase 1 per-anchor score table
 - pages/02_fragility.py           — Phase 2 Jacobian + fragility table
 - pages/03_drift.py               — Phase 3 drift timeline + detector
+- pages/04_recovery.py            — Phase 4 before/after + feedback
 
 Run with: `streamlit run src/maimonedes/dashboard/app.py`
 """
@@ -29,7 +30,10 @@ def _render() -> None:
         "aggregated fragility table across the eight anchors.\n"
         "- **Drift — Phase 3**: timeline plot of raw aggregate, EWMA, "
         "and CUSUM across a synthetic drift run with detection-latency "
-        "annotations."
+        "annotations.\n"
+        "- **Recovery — Phase 4**: before/after compliance bars plus the "
+        "synthesized feedback text rendered as a quote block, one panel "
+        "per affected anchor."
     )
 
 
