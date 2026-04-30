@@ -60,6 +60,12 @@ from maimonedes.monitor.fragility import (
     aggregated_fragility,
     all_jacobians,
 )
+from maimonedes.monitor.recovery_report import (
+    NoRecoveryDataError,
+    OrphanRecoveryRunError,
+    RecoveryReport,
+    build_report as build_recovery_report,
+)
 from maimonedes.monitor.localizer import localize
 from maimonedes.feedback.contrastive import fragility_pair, temporal_pair
 from maimonedes.settings import Settings, get_settings
@@ -981,6 +987,97 @@ def apply_feedback_cmd(
         f"failures={summary.failure_count} "
         f"mean_delta_toward_baseline={delta_str}"
     )
+
+
+def _format_recovery_table(report: RecoveryReport) -> list[str]:
+    headers = (
+        "anchor",
+        "pre_worst",
+        "pre_sess",
+        "post",
+        "delta",
+        "recovered",
+    )
+    rows: list[tuple[str, ...]] = []
+    for r in report.rows:
+        pre = (
+            f"{r.pre_worst_aggregate:.3f}"
+            if r.pre_worst_aggregate is not None
+            else "-"
+        )
+        sess = str(r.pre_worst_session) if r.pre_worst_session is not None else "-"
+        post = f"{r.post_aggregate:.3f}" if r.post_aggregate is not None else "-"
+        delta = (
+            f"{r.delta_toward_baseline:+.3f}"
+            if r.delta_toward_baseline is not None
+            else "-"
+        )
+        recovered = "yes" if r.recovered else "no"
+        rows.append((r.anchor_id, pre, sess, post, delta, recovered))
+
+    widths = [
+        max(len(headers[i]), *(len(row[i]) for row in rows)) if rows else len(headers[i])
+        for i in range(len(headers))
+    ]
+    lines: list[str] = []
+    lines.append("  ".join(h.ljust(w) for h, w in zip(headers, widths)))
+    lines.append("  ".join("-" * w for w in widths))
+    for row in rows:
+        lines.append("  ".join(c.ljust(w) for c, w in zip(row, widths)))
+    return lines
+
+
+@app.command("recovery-report")
+def recovery_report_cmd(
+    recovery_run_id: int = typer.Argument(
+        ..., help="recovery_run_id from `apply-feedback`."
+    ),
+    show_feedback: bool = typer.Option(
+        False,
+        "--show-feedback",
+        help="Print each anchor's synthesized feedback text below the table.",
+    ),
+) -> None:
+    """Print before/after summary for a recovery run."""
+    try:
+        report = build_recovery_report(recovery_run_id)
+    except OrphanRecoveryRunError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=4) from exc
+    except NoRecoveryDataError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+    typer.echo(
+        f"recovery_run_id={recovery_run_id} "
+        f"parent_drift_run_id={report.parent_drift_run_id} "
+        f"contrastive_kind={report.contrastive_kind}"
+    )
+    for line in _format_recovery_table(report):
+        typer.echo(line)
+
+    delta_str = (
+        f"{report.mean_delta_toward_baseline:+.3f}"
+        if report.mean_delta_toward_baseline is not None
+        else "n/a"
+    )
+    typer.echo(
+        f"mean_delta_toward_baseline={delta_str} "
+        f"recovered={report.recovered_count}/{report.total_anchors}"
+    )
+    typer.echo(f"verdict: {report.verdict}")
+
+    if show_feedback:
+        typer.echo("")
+        for r in report.rows:
+            if r.feedback is None:
+                typer.echo(f"[{r.anchor_id} contrastive=n/a]")
+                typer.echo("  (no feedback recorded)")
+                continue
+            typer.echo(
+                f"[{r.anchor_id} contrastive={r.feedback.contrastive_kind}]"
+            )
+            typer.echo(f"  > {r.feedback.feedback_text}")
 
 
 @app.command("fragility-report")
