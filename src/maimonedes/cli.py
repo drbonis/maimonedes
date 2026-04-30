@@ -1844,6 +1844,45 @@ def fragility_report_cmd(
     )
 
 
+@app.command("label-distribution")
+def label_distribution_cmd(
+    policy_path: Path = typer.Option(DEFAULT_POLICY_PATH, "--policy"),
+    rubric_path: Path = typer.Option(DEFAULT_RUBRIC_PATH, "--rubric"),
+    filter_sql: str = typer.Option(
+        "",
+        "--filter",
+        help=(
+            "Optional SQL fragment appended to WHERE; e.g. "
+            "\"judge_model LIKE 'judge%'\". Operator-only; do not pass "
+            "untrusted input."
+        ),
+    ),
+) -> None:
+    """Print the per-axis rubric-label distribution diagnostic.
+
+    For each sub-condition, shows the histogram of normalised values
+    seen in `compliance_scores`, sorted by `dominant_share` descending.
+    Axes whose `dominant_share` exceeds 0.85 are flagged with
+    `⚠ near-uniform — rubric refinement recommended` — they're not
+    fixable by upgrading the Stage-2 head architecture.
+    """
+    from maimonedes.monitor.label_distribution import (
+        compute_distribution,
+        format_report,
+    )
+    from maimonedes.storage.repo import init_engine
+
+    settings = get_settings()
+    init_engine(settings)
+    policy = load_policy(policy_path, rubric_path)
+    report = compute_distribution(
+        policy,
+        filter_sql=filter_sql or None,
+    )
+    for line in format_report(report):
+        typer.echo(line)
+
+
 def main(argv: list[str] | None = None) -> None:
     """Console-script entry point.
 
