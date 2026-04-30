@@ -23,9 +23,7 @@ from sqlalchemy import select
 
 from maimonedes.core.policy import Policy
 from maimonedes.llm.embed_client import EmbedClient
-from maimonedes.storage.compliance import ComplianceScoreRow
-from maimonedes.storage.llm_calls import LLMCall
-from maimonedes.storage.repo import get_session
+from maimonedes.storage.llm_calls import pair_supervised_with_scores
 
 
 log = logging.getLogger(__name__)
@@ -89,19 +87,19 @@ class GPTarget:
 def _fetch_training_points(
     policy_id: str, *, supervised_backend_prefix: str = "ollama-supervised"
 ) -> list[TrainingPoint]:
-    with get_session() as session:
-        rows = session.execute(
-            select(ComplianceScoreRow, LLMCall)
-            .join(LLMCall, ComplianceScoreRow.llm_call_id == LLMCall.id)
-            .where(
-                ComplianceScoreRow.policy_id == policy_id,
-                LLMCall.backend_name.like(f"{supervised_backend_prefix}%"),
-            )
-        ).all()
-        return [
-            TrainingPoint(text=llm.response_content, aggregate=float(score.aggregate))
-            for score, llm in rows
-        ]
+    """Pull (supervised_text, aggregate_score) pairs via chronological pairing.
+
+    Phase 1+ orchestrators don't wire `compliance_scores.llm_call_id`,
+    so we fall back to timestamp-ordered pairing. See
+    `storage.llm_calls.pair_supervised_with_scores`.
+    """
+    pairs = pair_supervised_with_scores(
+        policy_id, supervised_backend_prefix=supervised_backend_prefix
+    )
+    return [
+        TrainingPoint(text=p.supervised_text, aggregate=float(p.score.aggregate))
+        for p in pairs
+    ]
 
 
 def _default_kernel() -> Kernel:

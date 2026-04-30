@@ -22,9 +22,7 @@ from sqlalchemy import select
 from maimonedes.core.compliance import ComplianceScore
 from maimonedes.core.policy import Policy
 from maimonedes.llm.embed_client import EmbedClient
-from maimonedes.storage.compliance import ComplianceScoreRow, row_to_score
-from maimonedes.storage.llm_calls import LLMCall
-from maimonedes.storage.repo import get_session
+from maimonedes.storage.llm_calls import pair_supervised_with_scores
 
 
 log = logging.getLogger(__name__)
@@ -104,27 +102,19 @@ class Stage2Model:
 def _fetch_training_examples(
     policy_id: str, *, supervised_backend_prefix: str = "ollama-supervised"
 ) -> list[TrainingExample]:
-    """Pull (text, score) pairs where the score links to a supervised LLM output."""
-    with get_session() as session:
-        rows = session.execute(
-            select(ComplianceScoreRow, LLMCall)
-            .join(LLMCall, ComplianceScoreRow.llm_call_id == LLMCall.id)
-            .where(
-                ComplianceScoreRow.policy_id == policy_id,
-                LLMCall.backend_name.like(f"{supervised_backend_prefix}%"),
-            )
-        ).all()
-        out: list[TrainingExample] = []
-        for score_row, llm_row in rows:
-            score = row_to_score(score_row)
-            out.append(
-                TrainingExample(
-                    anchor_id=score.anchor_id,
-                    text=llm_row.response_content,
-                    score=score,
-                )
-            )
-        return out
+    """Pull (supervised_text, score) pairs via the chronological pairing helper.
+
+    See `storage.llm_calls.pair_supervised_with_scores` for the
+    rationale (Phase 1+ orchestrators do not wire
+    `compliance_scores.llm_call_id`).
+    """
+    pairs = pair_supervised_with_scores(
+        policy_id, supervised_backend_prefix=supervised_backend_prefix
+    )
+    return [
+        TrainingExample(anchor_id=p.anchor_id, text=p.supervised_text, score=p.score)
+        for p in pairs
+    ]
 
 
 def _stratified_split(
