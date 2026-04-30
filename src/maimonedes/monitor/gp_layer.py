@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Kernel, RBF
-from sqlalchemy import select
+from sklearn.preprocessing import StandardScaler
 
 from maimonedes.core.policy import Policy
 from maimonedes.llm.embed_client import EmbedClient
@@ -37,7 +37,15 @@ class TrainingPoint:
 
 @dataclass
 class ComplianceGP:
-    """A fitted Gaussian process over compliance-aggregate scores."""
+    """A fitted Gaussian process over compliance-aggregate scores.
+
+    `training_embeddings` and the inputs to `predict` are in the
+    ORIGINAL Bio_ClinicalBERT space. Scaling for the GP is applied
+    internally via `scaler` so callers don't have to thread the
+    transformation through. `scaler is None` is supported for
+    backward-compatibility with v1 (un-scaled) fits, though new
+    fits always populate it.
+    """
 
     policy_id: str
     trained_at: datetime
@@ -45,17 +53,23 @@ class ComplianceGP:
     embedding_model: str
     feature_dim: int
     gp: GaussianProcessRegressor
-    training_embeddings: np.ndarray  # shape (n, feature_dim)
+    training_embeddings: np.ndarray  # shape (n, feature_dim) in raw space
     training_aggregates: np.ndarray  # shape (n,)
     log_marginal_likelihood: float
     kernel_repr: str
     library_anchor_embeddings: dict[str, list[float]] = field(default_factory=dict)
+    scaler: StandardScaler | None = None
+
+    def _scale(self, embeddings: np.ndarray) -> np.ndarray:
+        if self.scaler is None:
+            return embeddings
+        return self.scaler.transform(embeddings)
 
     def predict(
         self, embeddings: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Return `(mean, std)` for each row of `embeddings`."""
-        mean, std = self.gp.predict(embeddings, return_std=True)
+        """Return `(mean, std)` for each row of `embeddings` (raw space)."""
+        mean, std = self.gp.predict(self._scale(embeddings), return_std=True)
         return np.asarray(mean), np.asarray(std)
 
     def save(self, path: str | Path) -> Path:
@@ -143,13 +157,20 @@ def fit_compliance_gp(
     y = np.asarray(aggregates, dtype=float)
     feature_dim = X.shape[1]
 
+    # Scale features so the kernel's length_scale settles in [0.1, 10].
+    # Without this, raw 768-dim Bio_ClinicalBERT magnitudes drive the
+    # constant-kernel and length_scale optimization to their boundaries
+    # and produce useless log-marginal-likelihoods (~ -1e11).
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
     gp = GaussianProcessRegressor(
         kernel=kernel or _default_kernel(),
         normalize_y=True,
         n_restarts_optimizer=n_restarts_optimizer,
         random_state=0,
     )
-    gp.fit(X, y)
+    gp.fit(X_scaled, y)
 
     library_anchors: dict[str, list[float]] = {}
     if library_anchor_texts:
@@ -170,11 +191,12 @@ def fit_compliance_gp(
         embedding_model=embedding_model,
         feature_dim=feature_dim,
         gp=gp,
-        training_embeddings=X,
+        training_embeddings=X,  # store RAW so propose_targets perturbs in raw space
         training_aggregates=y,
         log_marginal_likelihood=float(gp.log_marginal_likelihood_value_),
         kernel_repr=str(gp.kernel_),
         library_anchor_embeddings=library_anchors,
+        scaler=scaler,
     )
 
 
@@ -189,28 +211,42 @@ def propose_targets(
     """Propose top-K embedding-space targets ranked by uncertainty × boundary risk.
 
     Candidates are drawn by perturbing each training embedding with
-    Gaussian noise; if `perturbation_sigma` is None, the kernel's
-    length-scale is used as the perturbation magnitude (so candidates
-    explore at the GP's natural correlation distance).
+    Gaussian noise. If `perturbation_sigma` is None, the kernel's
+    length-scale (in SCALED space) is multiplied by each dimension's
+    raw-space std (`scaler.scale_`) so neighborhood exploration in
+    raw 768-dim Bio_ClinicalBERT space matches the GP's notion of
+    "one length-scale away". Without per-dim scaling, a scalar σ
+    drowns small-variance dimensions and under-explores large-
+    variance ones.
     """
     rng = np.random.default_rng(seed)
     if gp.training_embeddings.size == 0:
         return []
     n_train = gp.training_embeddings.shape[0]
+
     if perturbation_sigma is None:
-        # Best-effort length-scale extraction from sklearn's kernel.
         try:
             length_scale = getattr(gp.gp.kernel_, "length_scale", 1.0)
             if isinstance(length_scale, np.ndarray):
-                length_scale = float(np.mean(length_scale))
-            perturbation_sigma = float(length_scale)
+                length_scale_value = float(np.mean(length_scale))
+            else:
+                length_scale_value = float(length_scale)
         except Exception:
-            perturbation_sigma = 1.0
+            length_scale_value = 1.0
+        if gp.scaler is not None:
+            # length_scale lives in SCALED space; raw-space σ per dim
+            # is the dim's training std × the scaled length_scale.
+            per_dim_sigma = gp.scaler.scale_ * length_scale_value
+        else:
+            per_dim_sigma = np.full(gp.feature_dim, length_scale_value)
+    else:
+        per_dim_sigma = np.full(gp.feature_dim, float(perturbation_sigma))
 
     n_candidates = max(1, candidate_pool_size)
     seed_indices = rng.integers(0, n_train, size=n_candidates)
     seeds = gp.training_embeddings[seed_indices]
-    noise = rng.normal(0, perturbation_sigma, size=seeds.shape)
+    # rng.normal broadcasts per-dim scale across each row.
+    noise = rng.normal(0.0, per_dim_sigma, size=seeds.shape)
     candidates = seeds + noise
 
     mean, std = gp.predict(candidates)
