@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from sklearn.decomposition import PCA
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Kernel, RBF
 from sklearn.preprocessing import StandardScaler
@@ -59,17 +60,22 @@ class ComplianceGP:
     kernel_repr: str
     library_anchor_embeddings: dict[str, list[float]] = field(default_factory=dict)
     scaler: StandardScaler | None = None
+    pca: PCA | None = None  # optional dim-reduction; None = use scaled space
 
-    def _scale(self, embeddings: np.ndarray) -> np.ndarray:
-        if self.scaler is None:
-            return embeddings
-        return self.scaler.transform(embeddings)
+    def _to_gp_space(self, embeddings: np.ndarray) -> np.ndarray:
+        """Apply scaler → optional PCA so the GP sees its native space."""
+        x = embeddings
+        if self.scaler is not None:
+            x = self.scaler.transform(x)
+        if self.pca is not None:
+            x = self.pca.transform(x)
+        return x
 
     def predict(
         self, embeddings: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return `(mean, std)` for each row of `embeddings` (raw space)."""
-        mean, std = self.gp.predict(self._scale(embeddings), return_std=True)
+        mean, std = self.gp.predict(self._to_gp_space(embeddings), return_std=True)
         return np.asarray(mean), np.asarray(std)
 
     def save(self, path: str | Path) -> Path:
@@ -117,11 +123,13 @@ def _fetch_training_points(
 
 
 def _default_kernel() -> Kernel:
-    # Constant bound up to 1e6 because earlier fits without alpha
-    # absorbed all the observation noise into the constant and pinned
-    # at 1e3. With alpha now nonzero this is mostly defensive.
+    # length_scale upper bound bumped to 100 — earlier fits in raw 768-dim
+    # space pinned at the old 10 because the curse of dimensionality
+    # makes 768-dim Euclidean distances large; PCA preprocessing makes
+    # the old (0.1, 10) range workable, but we leave the higher ceiling
+    # so the optimizer has headroom either way.
     return ConstantKernel(1.0, (1e-3, 1e6)) * RBF(
-        length_scale=1.0, length_scale_bounds=(0.1, 10.0)
+        length_scale=1.0, length_scale_bounds=(0.1, 100.0)
     )
 
 
@@ -134,6 +142,13 @@ def _default_kernel() -> Kernel:
 # conditioned and the optimizer converges without hitting bounds.
 DEFAULT_ALPHA = 1e-2
 
+# Default PCA reduction. Bio_ClinicalBERT outputs 768-dim; with ~1700
+# points the curse of dimensionality forces every pairwise distance
+# into a narrow band and the RBF kernel can't find local structure.
+# 50 components captures most of the variance while keeping average
+# pairwise distance in a range the kernel can model.
+DEFAULT_PCA_COMPONENTS = 50
+
 
 def fit_compliance_gp(
     *,
@@ -145,6 +160,7 @@ def fit_compliance_gp(
     library_anchor_texts: dict[str, str] | None = None,
     n_restarts_optimizer: int = 5,
     alpha: float = DEFAULT_ALPHA,
+    pca_components: int | None = DEFAULT_PCA_COMPONENTS,
 ) -> ComplianceGP:
     """Pull (text, aggregate) pairs, embed, fit, return ComplianceGP.
 
@@ -171,12 +187,26 @@ def fit_compliance_gp(
     y = np.asarray(aggregates, dtype=float)
     feature_dim = X.shape[1]
 
-    # Scale features so the kernel's length_scale settles in [0.1, 10].
-    # Without this, raw 768-dim Bio_ClinicalBERT magnitudes drive the
-    # constant-kernel and length_scale optimization to their boundaries
-    # and produce useless log-marginal-likelihoods (~ -1e11).
+    # Scale features so the kernel's length_scale settles in a finite
+    # range. Without this, raw 768-dim Bio_ClinicalBERT magnitudes
+    # drive the kernel optimization to its boundaries.
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
+
+    # Optional PCA dim-reduction. With raw 768-dim and ~1700 samples
+    # the GP can't find local structure; PCA to ~50 dimensions keeps
+    # the principal variance and lets the kernel discriminate
+    # neighborhoods.
+    pca: PCA | None = None
+    if pca_components is not None and pca_components < X_scaled.shape[1]:
+        n_components = min(pca_components, X_scaled.shape[0] - 1)
+        if n_components >= 1:
+            pca = PCA(n_components=n_components, random_state=0)
+            X_gp = pca.fit_transform(X_scaled)
+        else:
+            X_gp = X_scaled
+    else:
+        X_gp = X_scaled
 
     gp = GaussianProcessRegressor(
         kernel=kernel or _default_kernel(),
@@ -185,7 +215,7 @@ def fit_compliance_gp(
         alpha=alpha,
         random_state=0,
     )
-    gp.fit(X_scaled, y)
+    gp.fit(X_gp, y)
 
     library_anchors: dict[str, list[float]] = {}
     if library_anchor_texts:
@@ -212,6 +242,7 @@ def fit_compliance_gp(
         kernel_repr=str(gp.kernel_),
         library_anchor_embeddings=library_anchors,
         scaler=scaler,
+        pca=pca,
     )
 
 
@@ -225,60 +256,70 @@ def propose_targets(
 ) -> list[GPTarget]:
     """Propose top-K embedding-space targets ranked by uncertainty × boundary risk.
 
-    Candidates are drawn by perturbing each training embedding with
-    Gaussian noise. If `perturbation_sigma` is None, the kernel's
-    length-scale (in SCALED space) is multiplied by each dimension's
-    raw-space std (`scaler.scale_`) so neighborhood exploration in
-    raw 768-dim Bio_ClinicalBERT space matches the GP's notion of
-    "one length-scale away". Without per-dim scaling, a scalar σ
-    drowns small-variance dimensions and under-explores large-
-    variance ones.
+    Candidates are perturbed in the GP's NATIVE input space (scaled,
+    optionally PCA-projected) so the noise actually reaches the GP's
+    posterior. Top-K are then inverse-transformed back to raw
+    768-dim Bio_ClinicalBERT space before being returned, so the
+    synthesizer (#42) and dashboard receive embeddings in the same
+    coordinate system as the library anchors.
+
+    `perturbation_sigma` overrides the kernel's length-scale-derived
+    perturbation magnitude when set — useful for sweeps.
     """
     rng = np.random.default_rng(seed)
     if gp.training_embeddings.size == 0:
         return []
-    n_train = gp.training_embeddings.shape[0]
+
+    # Project training embeddings into the GP's input space.
+    seeds_gp_space = gp._to_gp_space(gp.training_embeddings)
+    n_train, gp_dim = seeds_gp_space.shape
 
     if perturbation_sigma is None:
         try:
             length_scale = getattr(gp.gp.kernel_, "length_scale", 1.0)
             if isinstance(length_scale, np.ndarray):
-                length_scale_value = float(np.mean(length_scale))
+                sigma = float(np.mean(length_scale))
             else:
-                length_scale_value = float(length_scale)
+                sigma = float(length_scale)
         except Exception:
-            length_scale_value = 1.0
-        if gp.scaler is not None:
-            # length_scale lives in SCALED space; raw-space σ per dim
-            # is the dim's training std × the scaled length_scale.
-            per_dim_sigma = gp.scaler.scale_ * length_scale_value
-        else:
-            per_dim_sigma = np.full(gp.feature_dim, length_scale_value)
+            sigma = 1.0
     else:
-        per_dim_sigma = np.full(gp.feature_dim, float(perturbation_sigma))
+        sigma = float(perturbation_sigma)
 
     n_candidates = max(1, candidate_pool_size)
     seed_indices = rng.integers(0, n_train, size=n_candidates)
-    seeds = gp.training_embeddings[seed_indices]
-    # rng.normal broadcasts per-dim scale across each row.
-    noise = rng.normal(0.0, per_dim_sigma, size=seeds.shape)
-    candidates = seeds + noise
+    seeds = seeds_gp_space[seed_indices]
+    noise = rng.normal(0.0, sigma, size=seeds.shape)
+    candidates_gp = seeds + noise
 
-    mean, std = gp.predict(candidates)
+    # Predict directly on GP-space candidates (skipping `gp.predict`
+    # which would re-transform them).
+    mean, std = gp.gp.predict(candidates_gp, return_std=True)
     risk = np.abs(0.5 - mean)
     score = std * risk
 
-    # Sort candidates by score descending; tie-break by std then index for stability.
     order = np.argsort(-score, kind="stable")
     top_idx = order[:n_targets]
+
+    # Map top candidates back to raw 768-dim space: PCA inverse → scaler inverse.
+    top_gp = candidates_gp[top_idx]
+    if gp.pca is not None:
+        top_scaled = gp.pca.inverse_transform(top_gp)
+    else:
+        top_scaled = top_gp
+    if gp.scaler is not None:
+        top_raw = gp.scaler.inverse_transform(top_scaled)
+    else:
+        top_raw = top_scaled
+
     return [
         GPTarget(
-            embedding=[float(v) for v in candidates[i]],
+            embedding=[float(v) for v in top_raw[k]],
             expected_score=float(mean[i]),
             uncertainty=float(std[i]),
             score=float(score[i]),
         )
-        for i in top_idx
+        for k, i in enumerate(top_idx)
     ]
 
 
