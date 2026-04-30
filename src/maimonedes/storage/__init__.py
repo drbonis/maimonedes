@@ -10,6 +10,7 @@ from maimonedes.storage import (  # noqa: F401
     compliance,
     drift,
     embed_calls,
+    gp_fits,
     llm_calls,
     models,
     perturbations,

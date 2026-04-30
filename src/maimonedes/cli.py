@@ -552,6 +552,124 @@ def audit_stage2_cmd(
         )
 
 
+DEFAULT_GP_DIR = Path("models")
+
+
+@app.command("fit-gp")
+def fit_gp_cmd(
+    policy_path: Path = typer.Option(DEFAULT_POLICY_PATH, "--policy"),
+    rubric_path: Path = typer.Option(DEFAULT_RUBRIC_PATH, "--rubric"),
+    probes_path: Path = typer.Option(DEFAULT_PROBES_PATH, "--probes"),
+    output_dir: Path = typer.Option(
+        DEFAULT_GP_DIR, "--output-dir", help="Directory for the GP pickle artefact."
+    ),
+    output_path: Path | None = typer.Option(
+        None, "--output", help="Explicit output path. Overrides --output-dir."
+    ),
+    min_samples: int = typer.Option(
+        20, "--min-samples", help="Minimum (text, score) pairs required."
+    ),
+    replay: bool = typer.Option(
+        False,
+        "--replay",
+        help="Use the EmbedClient replay cache (free re-runs once embeddings are recorded).",
+    ),
+) -> None:
+    """Fit a GP over (embedding, aggregate) pairs from compliance_scores."""
+    from datetime import datetime, timezone
+
+    from maimonedes.llm.recording_embed_client import RecordingEmbedClient
+    from maimonedes.monitor.gp_layer import fit_compliance_gp
+    from maimonedes.storage.gp_fits import record_gp_fit
+
+    try:
+        policy = load_policy(policy_path, rubric_path)
+        anchors = load_anchors(probes_path)
+    except FileNotFoundError as exc:
+        typer.echo(f"config file not found: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+    except (ValueError, KeyError) as exc:
+        typer.echo(f"invalid configuration: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+
+    settings = get_settings()
+    backend = _embed_factory(settings)
+    rc = RecordingEmbedClient(
+        backend, backend_name="clinicalbert", replay=replay  # type: ignore[arg-type]
+    )
+
+    try:
+        gp = fit_compliance_gp(
+            embed_client=rc,
+            policy=policy,
+            embedding_model=settings.clinicalbert_model,
+            min_samples=min_samples,
+            library_anchor_texts={a.id: a.scenario for a in anchors},
+        )
+    except ValueError as exc:
+        typer.echo(f"GP fit failed: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+    except LLMError as exc:
+        typer.echo(f"embed backend error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    if output_path is None:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        output_path = output_dir / f"gp_{policy.id}_{timestamp}.pkl"
+    saved = gp.save(output_path)
+    fit_id = record_gp_fit(
+        path=str(saved),
+        policy_id=gp.policy_id,
+        n_samples=gp.n_samples,
+        kernel_name=gp.kernel_repr,
+        log_marginal_likelihood=gp.log_marginal_likelihood,
+        embedding_model=gp.embedding_model,
+    )
+
+    typer.echo(
+        f"gp_fit_id={fit_id} path={saved} n_samples={gp.n_samples} "
+        f"log_marginal_likelihood={gp.log_marginal_likelihood:.3f}"
+    )
+    typer.echo(f"  kernel={gp.kernel_repr}")
+
+
+@app.command("propose-targets")
+def propose_targets_cmd(
+    fit_id: int = typer.Argument(..., help="gp_fits.id to propose from."),
+    n: int = typer.Option(10, "--n", help="Number of targets to return."),
+    candidate_pool_size: int = typer.Option(
+        1000, "--pool", help="Candidate pool size (random perturbations)."
+    ),
+    seed: int = typer.Option(0, "--seed", help="RNG seed for reproducibility."),
+) -> None:
+    """Propose top-N embedding-space targets ranked by uncertainty × boundary risk."""
+    from maimonedes.monitor.gp_layer import ComplianceGP, propose_targets
+    from maimonedes.storage.gp_fits import get_gp_fit
+
+    fit_row = get_gp_fit(fit_id)
+    if fit_row is None:
+        typer.echo(f"unknown gp_fit_id: {fit_id}", err=True)
+        raise typer.Exit(code=4)
+    try:
+        gp = ComplianceGP.load(fit_row.path)
+    except (ValueError, FileNotFoundError) as exc:
+        typer.echo(f"failed to load gp fit: {exc}", err=True)
+        raise typer.Exit(code=4) from exc
+
+    targets = propose_targets(
+        gp,
+        n_targets=n,
+        candidate_pool_size=candidate_pool_size,
+        seed=seed,
+    )
+    typer.echo(f"gp_fit_id={fit_id} n_targets={len(targets)}")
+    for i, t in enumerate(targets, start=1):
+        typer.echo(
+            f"  T{i:02d}  expected_score={t.expected_score:+.3f} "
+            f"uncertainty={t.uncertainty:.3f} score={t.score:.3f}"
+        )
+
+
 @app.command("run-once")
 def run_once_cmd(
     anchor_id: str = typer.Argument(..., help="Anchor id, e.g. A3."),
