@@ -670,6 +670,189 @@ def propose_targets_cmd(
         )
 
 
+def _stream_synthesis_progress(progress) -> None:  # type: ignore[no-untyped-def]
+    o = progress.outcome
+    s = o.synthesis
+    if o.error:
+        typer.echo(
+            f"  T{progress.target_index:02d}  FAIL  error={o.error}"
+        )
+        return
+    score_str = (
+        f"score={o.score.aggregate:.3f}" if o.score is not None else "score=skipped"
+    )
+    typer.echo(
+        f"  T{progress.target_index:02d}  status={s.status} "
+        f"cos={s.tau_distance:+.3f} retries={s.retries_used} {score_str}"
+    )
+
+
+@app.command("synthesize-probes")
+def synthesize_probes_cmd(
+    gp_fit_id: int = typer.Argument(..., help="gp_fits.id to synthesize against."),
+    n: int = typer.Option(
+        10, "--n", help="Number of GP-proposed targets to attempt."
+    ),
+    tau: float = typer.Option(
+        0.7, "--tau", help="Cosine similarity threshold (achieved vs target)."
+    ),
+    max_retries: int = typer.Option(
+        3, "--max-retries", help="Per-target retry budget on tau failures."
+    ),
+    generator_model: str | None = typer.Option(
+        None,
+        "--generator-model",
+        help="LLM model used for scenario generation (default: judge model).",
+    ),
+    validator_model: str | None = typer.Option(
+        None,
+        "--validator-model",
+        help="LLM model used for the quality gate (default: judge model).",
+    ),
+    scorer: str = typer.Option(
+        "judge",
+        "--scorer",
+        help="Scorer for approved synthesized probes: judge | classifier.",
+    ),
+    stage2_model_id: int | None = typer.Option(
+        None,
+        "--stage2-model",
+        help="stage2_models.id to use when --scorer=classifier.",
+    ),
+    policy_path: Path = typer.Option(DEFAULT_POLICY_PATH, "--policy"),
+    rubric_path: Path = typer.Option(DEFAULT_RUBRIC_PATH, "--rubric"),
+    probes_path: Path = typer.Option(DEFAULT_PROBES_PATH, "--probes"),
+    replay: bool = typer.Option(
+        False,
+        "--replay",
+        help="Use the EmbedClient + RecordingClient replay caches.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Propose targets and print the K nearest library anchors per target without LLM calls.",
+    ),
+) -> None:
+    """Generate synthesized probes from GP targets, optionally scoring each."""
+    if scorer not in ("judge", "classifier"):
+        raise typer.BadParameter(
+            f"--scorer must be 'judge' or 'classifier', got {scorer!r}"
+        )
+    if scorer == "classifier" and stage2_model_id is None:
+        typer.echo(
+            "--scorer=classifier requires --stage2-model <id>", err=True
+        )
+        raise typer.Exit(code=5)
+    if n < 1:
+        raise typer.BadParameter("--n must be >= 1")
+
+    from maimonedes.experiments.synthesize_probes import synthesize_probes
+    from maimonedes.feedback.probe_synthesis import _cosine_similarity
+    from maimonedes.models.stage2 import Stage2Model
+    from maimonedes.monitor.gp_layer import ComplianceGP, propose_targets
+    from maimonedes.storage.gp_fits import get_gp_fit
+    from maimonedes.storage.stage2_models import get_stage2_model
+
+    try:
+        policy = load_policy(policy_path, rubric_path)
+        anchors = load_anchors(probes_path)
+    except FileNotFoundError as exc:
+        typer.echo(f"config file not found: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+    except (ValueError, KeyError) as exc:
+        typer.echo(f"invalid configuration: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+
+    fit_row = get_gp_fit(gp_fit_id)
+    if fit_row is None:
+        typer.echo(f"unknown gp_fit_id: {gp_fit_id}", err=True)
+        raise typer.Exit(code=4)
+    try:
+        gp = ComplianceGP.load(fit_row.path)
+    except (ValueError, FileNotFoundError) as exc:
+        typer.echo(f"failed to load gp fit: {exc}", err=True)
+        raise typer.Exit(code=4) from exc
+
+    settings = get_settings()
+    generator_model = generator_model or settings.ollama_judge_model
+    validator_model = validator_model or settings.ollama_judge_model
+
+    if dry_run:
+        targets = propose_targets(gp, n_targets=n, candidate_pool_size=500, seed=0)
+        typer.echo(
+            f"gp_fit_id={gp_fit_id} n_targets={len(targets)} (dry-run, no LLM calls)"
+        )
+        for i, t in enumerate(targets, start=1):
+            nearest: list[tuple[str, float]] = []
+            for anchor_id, vec in gp.library_anchor_embeddings.items():
+                cos = _cosine_similarity(t.embedding, vec)
+                nearest.append((anchor_id, cos))
+            nearest.sort(key=lambda kv: -kv[1])
+            top = ", ".join(f"{aid}({cos:+.2f})" for aid, cos in nearest[:5])
+            typer.echo(
+                f"  T{i:02d}  uncertainty={t.uncertainty:.3f} "
+                f"expected_score={t.expected_score:+.3f} "
+                f"top_5_nearest=[{top}]"
+            )
+        return
+
+    stage2_model = None
+    if scorer == "classifier":
+        stage2_row = get_stage2_model(stage2_model_id)  # type: ignore[arg-type]
+        if stage2_row is None:
+            typer.echo(
+                f"unknown stage2_model id: {stage2_model_id}", err=True
+            )
+            raise typer.Exit(code=4)
+        stage2_model = Stage2Model.load(stage2_row.path)
+
+    embed_backend = _embed_factory(settings)
+    chat_backend = _backend_factory(settings)
+
+    try:
+        summary = synthesize_probes(
+            gp_fit=gp,
+            n_targets=n,
+            embed_client=embed_backend,  # type: ignore[arg-type]
+            generator_client=chat_backend,  # type: ignore[arg-type]
+            validator_client=chat_backend,  # type: ignore[arg-type]
+            supervised_client=chat_backend,  # type: ignore[arg-type]
+            judge_client=chat_backend,  # type: ignore[arg-type]
+            embedding_model=settings.clinicalbert_model,
+            generator_model=generator_model,
+            validator_model=validator_model,
+            supervised_model=settings.ollama_supervised_model,
+            judge_model=settings.ollama_judge_model,
+            policy=policy,
+            anchors=anchors,
+            scorer=scorer,  # type: ignore[arg-type]
+            stage2_model=stage2_model,
+            gp_fit_id=gp_fit_id,
+            tau=tau,
+            max_retries=max_retries,
+            replay=replay,
+            on_progress=_stream_synthesis_progress,
+        )
+    except ValueError as exc:
+        typer.echo(f"synthesis failed: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+    except LLMError as exc:
+        typer.echo(f"LLM backend error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    mean_str = (
+        f"{summary.mean_aggregate:.3f}"
+        if summary.mean_aggregate is not None
+        else "n/a"
+    )
+    typer.echo(
+        f"n_targets={summary.n_targets} approved={summary.n_approved} "
+        f"rejected_tau={summary.n_rejected_tau} "
+        f"rejected_validator={summary.n_rejected_validator} "
+        f"scored={summary.n_scored} mean_aggregate={mean_str}"
+    )
+
+
 @app.command("run-once")
 def run_once_cmd(
     anchor_id: str = typer.Argument(..., help="Anchor id, e.g. A3."),
