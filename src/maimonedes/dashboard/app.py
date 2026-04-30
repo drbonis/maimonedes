@@ -8,6 +8,7 @@ lives in:
 - pages/02_fragility.py           — Phase 2 Jacobian + fragility table
 - pages/03_drift.py               — Phase 3 drift timeline + detector
 - pages/04_recovery.py            — Phase 4 before/after + feedback
+- pages/05_gp.py                  — Phase 5 GP uncertainty surface + targets
 
 Run with: `streamlit run src/maimonedes/dashboard/app.py`
 """
@@ -33,7 +34,10 @@ def _render() -> None:
         "annotations.\n"
         "- **Recovery — Phase 4**: before/after compliance bars plus the "
         "synthesized feedback text rendered as a quote block, one panel "
-        "per affected anchor."
+        "per affected anchor.\n"
+        "- **GP — Phase 5**: PCA-projected scatter of training embeddings + "
+        "library anchors + proposed targets, ranked by uncertainty × "
+        "boundary risk."
     )
 
 
