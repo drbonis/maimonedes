@@ -243,6 +243,111 @@ def embed_ping(
     typer.echo(f"latency_ms={response.latency_ms:.1f}")
 
 
+DEFAULT_STAGE2_DIR = Path("models")
+
+
+@app.command("train-stage2")
+def train_stage2_cmd(
+    policy_path: Path = typer.Option(DEFAULT_POLICY_PATH, "--policy"),
+    rubric_path: Path = typer.Option(DEFAULT_RUBRIC_PATH, "--rubric"),
+    output_dir: Path = typer.Option(
+        DEFAULT_STAGE2_DIR,
+        "--output-dir",
+        help="Directory to write the Stage-2 pickle artefact under.",
+    ),
+    output_path: Path | None = typer.Option(
+        None,
+        "--output",
+        help="Explicit output path. Overrides --output-dir.",
+    ),
+    min_samples: int = typer.Option(
+        50, "--min-samples", help="Minimum training pairs required."
+    ),
+    eval_fraction: float = typer.Option(
+        0.2, "--eval-fraction", help="Hold-out fraction (stratified by anchor)."
+    ),
+    ridge_alpha: float = typer.Option(
+        1.0, "--ridge-alpha", help="L2 regularization for Ridge heads."
+    ),
+    seed: int = typer.Option(0, "--seed", help="Split + Ridge RNG seed."),
+    replay: bool = typer.Option(
+        False,
+        "--replay",
+        help="Use the EmbedClient replay cache (re-runs are free if "
+        "embeddings are already recorded).",
+    ),
+) -> None:
+    """Train a Stage-2 classifier on existing supervised + judge data."""
+    from datetime import datetime, timezone
+
+    from maimonedes.llm.recording_embed_client import RecordingEmbedClient
+    from maimonedes.models.stage2 import train_stage2
+    from maimonedes.storage.stage2_models import record_stage2_model
+
+    try:
+        policy = load_policy(policy_path, rubric_path)
+    except FileNotFoundError as exc:
+        typer.echo(f"config file not found: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+    except (ValueError, KeyError) as exc:
+        typer.echo(f"invalid configuration: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+
+    settings = get_settings()
+    backend = _embed_factory(settings)
+    rc = RecordingEmbedClient(
+        backend, backend_name="clinicalbert", replay=replay  # type: ignore[arg-type]
+    )
+
+    try:
+        model = train_stage2(
+            policy=policy,
+            embed_client=rc,
+            embedding_model=settings.clinicalbert_model,
+            min_samples=min_samples,
+            eval_fraction=eval_fraction,
+            ridge_alpha=ridge_alpha,
+            seed=seed,
+        )
+    except ValueError as exc:
+        typer.echo(f"training failed: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+    except LLMError as exc:
+        typer.echo(f"embed backend error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    if output_path is None:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        output_path = output_dir / f"stage2_{policy.id}_{timestamp}.pkl"
+    saved = model.save(output_path)
+
+    mae = {m.sub_id: m.mae for m in model.agreement_metrics}
+    rho = {m.sub_id: m.spearman_rho for m in model.agreement_metrics}
+    model_id = record_stage2_model(
+        path=str(saved),
+        policy_id=model.policy_id,
+        n_samples=model.n_samples,
+        embedding_model=model.embedding_model,
+        mae_per_axis=mae,
+        spearman_per_axis=rho,
+        agreement_status=model.agreement_status,
+    )
+
+    typer.echo(
+        f"stage2_model_id={model_id} path={saved} "
+        f"n_train={model.n_train} n_eval={model.n_eval} "
+        f"agreement_status={model.agreement_status}"
+    )
+    for m in model.agreement_metrics:
+        typer.echo(
+            f"  axis={m.sub_id:<46} mae={m.mae:.3f} spearman_rho={m.spearman_rho:+.3f}"
+        )
+
+    if model.agreement_status == "red":
+        # A red Stage-2 model is not deployable for online scoring.
+        raise typer.Exit(code=6)
+
+
 @app.command("run-once")
 def run_once_cmd(
     anchor_id: str = typer.Argument(..., help="Anchor id, e.g. A3."),
