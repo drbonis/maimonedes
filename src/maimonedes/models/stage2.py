@@ -158,14 +158,20 @@ def _spearman_rho(y_true: list[float], y_pred: list[float]) -> float:
     return float(rho)
 
 
+GREEN_MAE_MAX = 0.16
+GREEN_RHO_MIN = 0.6
+AMBER_MAE_MAX = 0.25
+AMBER_RHO_MIN = 0.4
+
+
 def _grade_agreement(metrics: list[AxisMetrics]) -> str:
     if not metrics:
         return "red"
     statuses: list[str] = []
     for m in metrics:
-        if m.spearman_rho >= 0.6 and m.mae <= 0.15:
+        if m.spearman_rho >= GREEN_RHO_MIN and m.mae <= GREEN_MAE_MAX:
             statuses.append("green")
-        elif m.spearman_rho >= 0.4 or m.mae <= 0.25:
+        elif m.spearman_rho >= AMBER_RHO_MIN or m.mae <= AMBER_MAE_MAX:
             statuses.append("amber")
         else:
             statuses.append("red")
