@@ -35,6 +35,39 @@ EMPTY_STATE_MSG = (
     "No GP fits recorded yet. Run `maimonedes fit-gp` to populate this dashboard."
 )
 UMAP_N_NEIGHBORS = 15  # UMAP requires at least n_neighbors+1 points to fit
+TOOLTIP_TEXT_CHARS = 120  # max chars of probe text to show in hover tooltip
+TARGET_TOOLTIP_K_NEAREST = 3  # number of nearest library anchors per target tooltip
+
+
+def _truncate(text: str, limit: int = TOOLTIP_TEXT_CHARS) -> str:
+    text = text.strip().replace("\n", " ")
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
+
+
+def _top_k_nearest_anchors(
+    target_embedding: list[float],
+    library: dict[str, list[float]],
+    k: int = TARGET_TOOLTIP_K_NEAREST,
+) -> list[tuple[str, float]]:
+    """Top-K nearest library anchors by cosine similarity, descending."""
+    if not library:
+        return []
+    target = np.asarray(target_embedding, dtype=float)
+    target_norm = float(np.linalg.norm(target))
+    if target_norm == 0:
+        return []
+    scored: list[tuple[str, float]] = []
+    for anchor_id, vec in library.items():
+        v = np.asarray(vec, dtype=float)
+        n = float(np.linalg.norm(v))
+        if n == 0:
+            continue
+        cos = float(np.dot(target, v) / (target_norm * n))
+        scored.append((anchor_id, cos))
+    scored.sort(key=lambda kv: -kv[1])
+    return scored[:k]
 
 
 def _project_2d(combined: np.ndarray) -> tuple[np.ndarray, str]:
@@ -156,10 +189,19 @@ def _cached_snapshot(fit_id: int) -> GPSnapshot | None:
     combined = np.vstack(stack)
     coords, projection_method = _project_2d(combined)
 
+    # Pre-extract text payloads. Older artefacts have these as empty
+    # defaults — tooltip falls back to bare-label form when missing.
+    training_texts = list(getattr(gp, "training_texts", []) or [])
+    has_training_texts = len(training_texts) == gp.training_embeddings.shape[0]
+    library_anchor_texts = dict(getattr(gp, "library_anchor_texts", {}) or {})
+
     points: list[GPScatterPoint] = []
     n_train = gp.training_embeddings.shape[0]
     for i in range(n_train):
         agg = float(gp.training_aggregates[i])
+        label = f"train[{i}]<br>aggregate={agg:.3f}"
+        if has_training_texts:
+            label += f"<br>{_truncate(training_texts[i])}"
         points.append(
             GPScatterPoint(
                 kind="training",
@@ -167,7 +209,7 @@ def _cached_snapshot(fit_id: int) -> GPSnapshot | None:
                 y=float(coords[i, 1]),
                 aggregate=agg,
                 score=None,
-                label=f"train[{i}] aggregate={agg:.3f}",
+                label=label,
             )
         )
 
@@ -177,6 +219,18 @@ def _cached_snapshot(fit_id: int) -> GPSnapshot | None:
             x = float(coords[n_used, 0])
             y = float(coords[n_used, 1])
             n_used += 1
+            label_lines = [
+                f"target[{j+1}]",
+                f"score={target.score:.3f} σ={target.uncertainty:.3f} μ={target.expected_score:.3f}",
+            ]
+            top_k = _top_k_nearest_anchors(
+                target.embedding, gp.library_anchor_embeddings
+            )
+            if top_k:
+                rendered = ", ".join(
+                    f"{aid} (cos={cos:.2f})" for aid, cos in top_k
+                )
+                label_lines.append(f"nearest: {rendered}")
             points.append(
                 GPScatterPoint(
                     kind="target",
@@ -185,10 +239,7 @@ def _cached_snapshot(fit_id: int) -> GPSnapshot | None:
                     aggregate=None,
                     score=target.score,
                     uncertainty=target.uncertainty,
-                    label=(
-                        f"target[{j+1}] score={target.score:.3f} "
-                        f"σ={target.uncertainty:.3f} μ={target.expected_score:.3f}"
-                    ),
+                    label="<br>".join(label_lines),
                 )
             )
 
@@ -197,6 +248,10 @@ def _cached_snapshot(fit_id: int) -> GPSnapshot | None:
             x = float(coords[n_used, 0])
             y = float(coords[n_used, 1])
             n_used += 1
+            label = f"library_anchor={anchor_id}"
+            anchor_text = library_anchor_texts.get(anchor_id)
+            if anchor_text:
+                label += f"<br>{_truncate(anchor_text)}"
             points.append(
                 GPScatterPoint(
                     kind="anchor",
@@ -204,7 +259,7 @@ def _cached_snapshot(fit_id: int) -> GPSnapshot | None:
                     y=y,
                     aggregate=None,
                     score=None,
-                    label=f"library_anchor={anchor_id}",
+                    label=label,
                 )
             )
 

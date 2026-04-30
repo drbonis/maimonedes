@@ -176,6 +176,39 @@ def test_fit_compliance_gp_caches_library_anchors(
     assert set(gp.library_anchor_embeddings) == {"A1", "A2"}
     for emb in gp.library_anchor_embeddings.values():
         assert len(emb) == 8
+    # Texts also persisted on the artefact for dashboard tooltips.
+    assert gp.library_anchor_texts == library
+
+
+def test_fit_compliance_gp_persists_training_texts(
+    db: str, policy: Policy
+) -> None:
+    """training_texts is populated in fit-order for tooltip rendering."""
+    n = _seed_training_pairs(policy)
+    fake_embed = FakeEmbedClient(default_dim=8)
+    gp = fit_compliance_gp(
+        embed_client=fake_embed,
+        policy=policy,
+        embedding_model="fake-embed",
+        min_samples=10,
+    )
+    assert len(gp.training_texts) == n
+    assert gp.training_embeddings.shape[0] == n
+    assert all(isinstance(t, str) and t for t in gp.training_texts)
+
+
+def test_compliance_gp_text_fields_have_empty_defaults() -> None:
+    """Old artefacts (pre-tooltip) deserialize with empty defaults so
+    the dashboard can fall back to bare-label tooltips."""
+    from dataclasses import fields
+
+    from maimonedes.monitor.gp_layer import ComplianceGP
+
+    f_map = {f.name: f for f in fields(ComplianceGP)}
+    assert "training_texts" in f_map
+    assert "library_anchor_texts" in f_map
+    assert f_map["training_texts"].default_factory() == []
+    assert f_map["library_anchor_texts"].default_factory() == {}
 
 
 def test_compliance_gp_save_load_round_trip(

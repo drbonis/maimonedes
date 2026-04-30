@@ -61,6 +61,10 @@ class ComplianceGP:
     library_anchor_embeddings: dict[str, list[float]] = field(default_factory=dict)
     scaler: StandardScaler | None = None
     pca: PCA | None = None  # optional dim-reduction; None = use scaled space
+    # Optional text payload, used by the dashboard for hover tooltips.
+    # Default-empty for backward compat with pre-existing pickled artefacts.
+    training_texts: list[str] = field(default_factory=list)
+    library_anchor_texts: dict[str, str] = field(default_factory=dict)
 
     def _to_gp_space(self, embeddings: np.ndarray) -> np.ndarray:
         """Apply scaler → optional PCA so the GP sees its native space."""
@@ -231,11 +235,13 @@ def fit_compliance_gp(
     gp.fit(X_gp, y)
 
     library_anchors: dict[str, list[float]] = {}
+    library_text_payload: dict[str, str] = {}
     if library_anchor_texts:
         for anchor_id, text in library_anchor_texts.items():
             try:
                 resp = embed_client.embed(text, model=embedding_model)
                 library_anchors[anchor_id] = resp.embedding
+                library_text_payload[anchor_id] = text
             except Exception as exc:
                 log.warning(
                     "gp_layer.library_anchor_embed_failed",
@@ -256,6 +262,8 @@ def fit_compliance_gp(
         library_anchor_embeddings=library_anchors,
         scaler=scaler,
         pca=pca,
+        training_texts=[p.text for p in points],
+        library_anchor_texts=library_text_payload,
     )
 
 
