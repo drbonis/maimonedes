@@ -64,6 +64,44 @@ def test_strip_text_removes_fences_and_quotes() -> None:
     assert _strip_text("  spaced  ") == "spaced"
 
 
+def test_strip_text_removes_okay_i_understand_prefix() -> None:
+    raw = "Okay, I understand the rules. Hi, I'm John, a 65-year-old man."
+    assert _strip_text(raw) == "Hi, I'm John, a 65-year-old man."
+
+
+def test_strip_text_removes_new_scenario_header() -> None:
+    raw = "**New Scenario:**\n\nHi, I'm John, a 58-year-old man working as a teacher."
+    assert _strip_text(raw).startswith("Hi, I'm John")
+
+
+def test_strip_text_removes_output_header() -> None:
+    raw = "**Output:** Hi, I'm John, a 58-year-old man."
+    assert _strip_text(raw) == "Hi, I'm John, a 58-year-old man."
+
+
+def test_strip_text_removes_numbered_list_prefix() -> None:
+    raw = "9. (A9) Hi, I'm John, a 60-year-old man working as a teacher."
+    assert _strip_text(raw).startswith("Hi, I'm John")
+
+
+def test_strip_text_removes_anchor_id_prefix() -> None:
+    raw = "(A1) Hi, I'm John, a 58-year-old man working as a teacher."
+    assert _strip_text(raw).startswith("Hi, I'm John")
+
+
+def test_strip_text_strips_stacked_prefixes() -> None:
+    raw = (
+        "Okay, I understand the rules. **New Scenario:** "
+        "Hi, I'm John, a 65-year-old man."
+    )
+    assert _strip_text(raw).startswith("Hi, I'm John")
+
+
+def test_strip_text_passes_through_clean_scenario() -> None:
+    raw = "Hi, I'm Maria, a 52-year-old female nurse. ..."
+    assert _strip_text(raw) == raw
+
+
 def test_parse_validator_yes_approved() -> None:
     approved, reason = _parse_validator("yes: this is realistic.")
     assert approved is True
@@ -76,6 +114,28 @@ def test_parse_validator_no_rejected() -> None:
     assert "vague" in reason
 
 
+def test_parse_validator_markdown_bolded_yes_approved() -> None:
+    """medgemma sometimes returns `**yes**: ...`; the parser must accept it."""
+    approved, reason = _parse_validator(
+        "**yes**: clinically realistic patient query"
+    )
+    assert approved is True
+    assert "realistic" in reason
+
+
+def test_parse_validator_markdown_bolded_yes_without_colon() -> None:
+    approved, _reason = _parse_validator(
+        "**yes**\nThis is a clinically realistic patient query."
+    )
+    assert approved is True
+
+
+def test_parse_validator_markdown_bolded_no_rejected() -> None:
+    approved, reason = _parse_validator("**no**: missing demographic preamble.")
+    assert approved is False
+    assert "preamble" in reason
+
+
 def test_parse_validator_ambiguous_treated_as_rejected() -> None:
     approved, reason = _parse_validator("Maybe — depends on context.")
     assert approved is False
@@ -86,6 +146,15 @@ def test_parse_validator_empty_treated_as_rejected() -> None:
     approved, reason = _parse_validator("   ")
     assert approved is False
     assert "empty" in reason
+
+
+def test_parse_validator_internal_monologue_rejected() -> None:
+    """Validator sometimes dumps thinking-process notes instead of yes/no.
+    First word isn't 'yes' — should be rejected."""
+    approved, _ = _parse_validator(
+        "**Thinking Process:**\n\n1.  Analyze the Policy: ..."
+    )
+    assert approved is False
 
 
 # ---- prompt template -------------------------------------------------------

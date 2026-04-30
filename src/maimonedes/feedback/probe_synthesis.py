@@ -14,6 +14,7 @@ Per the locked decisions in the planning thread:
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -42,6 +43,33 @@ DEFAULT_TAU = 0.7
 DEFAULT_MAX_RETRIES = 3
 MAX_SCENARIO_CHARS = 500
 FENCE_CHARS = ("```", '"""', "'''")
+
+# Meta-prefix patterns the generator LLM emits despite the prompt's
+# "no markdown, no commentary" instruction. medgemma 4B in particular
+# tends to wrap its scenario in markdown headers or open with a
+# rule-acknowledgement preamble. We strip these so the cleaned text
+# starts at the actual scenario.
+_META_PREFIX_RE = re.compile(
+    r"""
+    ^(?:
+        # "Okay, I understand the rules. I will generate ..." up to the
+        # first sentence-ending punctuation.
+        okay[^.]*\.\s*
+        | # "**New Scenario:**", "**Output:**", "**Scenario:**", etc.
+        \**\s*(new\s+scenario|output|scenario|new\s+scenario\s*\d*)\s*:?\s*\**\s*\n?
+        | # Numbered list-item prefix like "9. (A9) "
+        \d+\.\s*\([A-Z]\d+\)\s*
+        | # Bare list-item prefix like "(A1) "
+        \(\s*[A-Z]\d+\s*\)\s*
+        | # "**Thinking Process:**" / "**Constraint Checklist:**" — these
+          # almost always indicate a generator failure rather than a
+          # recoverable scenario, but we still try to extract what's after
+          # them; if nothing remains, the validator catches it.
+        \**\s*(thinking\s+process|constraint\s+checklist)\s*:?\s*\**\s*\n?
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
 
 
 SynthesisStatus = Literal[
@@ -84,23 +112,42 @@ def _cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
 
 def _strip_text(raw: str) -> str:
     text = raw.strip()
+    # Strip code/quote fences first.
     for fence in FENCE_CHARS:
         if text.startswith(fence):
             text = text[len(fence) :].lstrip("\n")
         if text.endswith(fence):
             text = text[: -len(fence)].rstrip("\n")
-    return text.strip().strip('"').strip("'").strip()
+    text = text.strip().strip('"').strip("'").strip()
+    # Strip leading meta-prefixes the generator emits despite the prompt.
+    # Apply iteratively in case multiple prefixes stack ("Okay, I
+    # understand. **New Scenario:** ...").
+    for _ in range(4):
+        match = _META_PREFIX_RE.match(text)
+        if not match:
+            break
+        text = text[match.end() :].strip()
+    return text
 
 
 def _parse_validator(reply: str) -> tuple[bool, str]:
-    """Return `(approved, reason)`. Defaults to rejected on ambiguous output."""
+    """Return `(approved, reason)`. Defaults to rejected on ambiguous output.
+
+    Robust to markdown decoration: medgemma sometimes returns
+    `**yes**: clinically realistic ...` instead of plain `yes: ...`.
+    Strip `*` / `_` / `` ` `` from the verdict before checking the
+    first word, but preserve the original `reply` for the reason.
+    """
     text = reply.strip()
     if not text:
         return False, "validator returned empty response"
-    head = text.split(":", 1)
-    verdict = head[0].strip().lower()
-    reason = head[1].strip() if len(head) > 1 else text
-    first_word = verdict.split()[0] if verdict else ""
+    # Strip markdown bold/italic/code from the head only — the reason
+    # text after the colon is shown to operators verbatim, so we keep
+    # its decoration intact.
+    head_raw, _, tail = text.partition(":")
+    head_clean = re.sub(r"[*_`#]+", "", head_raw).strip().lower()
+    first_word = head_clean.split()[0] if head_clean else ""
+    reason = tail.strip() if tail else text
     if first_word == "yes":
         return True, reason
     return False, reason
