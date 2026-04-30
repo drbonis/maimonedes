@@ -45,6 +45,10 @@ class ComplianceScore(BaseModel):
     # Phase 4: scores collected during a recovery run carry the FK to
     # their `recovery_run`; non-recovery rows leave it None.
     recovery_run_id: int | None = None
+    # Phase 5: scores produced by evaluating a synthesized probe carry
+    # the FK to the source row in `synthesized_probes`; non-synthesized
+    # rows leave it None.
+    synthesized_probe_id: int | None = None
     scored_at: datetime = Field(default_factory=_utcnow)
 
 

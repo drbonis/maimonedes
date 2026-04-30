@@ -16,4 +16,5 @@ from maimonedes.storage import (  # noqa: F401
     perturbations,
     recovery,
     stage2_models,
+    synthesized_probes,
 )

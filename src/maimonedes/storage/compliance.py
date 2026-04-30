@@ -53,6 +53,9 @@ class ComplianceScoreRow(Base):
     recovery_run_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("recovery_runs.id"), nullable=True
     )
+    synthesized_probe_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("synthesized_probes.id"), nullable=True
+    )
     scored_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -81,6 +84,7 @@ def row_to_score(row: ComplianceScoreRow) -> ComplianceScore:
         probe_role=row.probe_role,  # type: ignore[arg-type]
         drift_session_id=row.drift_session_id,
         recovery_run_id=row.recovery_run_id,
+        synthesized_probe_id=row.synthesized_probe_id,
         scored_at=scored_at,
     )
 
@@ -101,6 +105,7 @@ def record_score(score: ComplianceScore) -> int:
             probe_role=score.probe_role,
             drift_session_id=score.drift_session_id,
             recovery_run_id=score.recovery_run_id,
+            synthesized_probe_id=score.synthesized_probe_id,
             scored_at=score.scored_at,
         )
         session.add(row)
