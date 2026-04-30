@@ -200,15 +200,32 @@ CUSUM per (anchor, policy axis) using Euclidean displacement (Riemannian upgrade
 
 ---
 
-### Phase 5 — v2 entry points (deferred)
+### Phase 5 — v2 entry points
 
-Each is independent and can be picked up after v1 lands:
+Each is independent. Marked **[shipped]** if implemented in v1 (with concrete decisions noted), **[deferred]** if still future work.
 
-- **Stage-2 classifier:** fine-tune ClinicalBERT (`emilyalsentzer/Bio_ClinicalBERT`) on judge-labeled (output_text, score) pairs; regression head per policy axis; periodic Stage-1 audit of Stage-2 drift.
-- **GP layer:** Gaussian process with non-stationary RBF kernel over output embeddings → uncertainty-driven probe scheduling and self-improving coverage.
-- **Riemannian metric learner:** small MLP trained on Jacobians from Phase 2; maps compliance position → local metric tensor; upgrade all distance computations.
-- **Decoupling and curvature signals:** covariance structure monitoring between policy axes; curvature monitoring on the learned metric.
-- **Gradient-guided probe generation:** automated synthesis of probes targeting high-risk, high-uncertainty regions of the compliance space.
+**Bio_ClinicalBERT embedding service.** A standalone HTTP service runs alongside Ollama at `http://192.168.1.30:8000/embed` and serves Bio_ClinicalBERT 768-dim embeddings for arbitrary text. v1's Stage-2 classifier, GP layer, and probe synthesizer all consume it through `llm.embed_client.EmbedClient`, with full request/response audit to a dedicated `embed_calls` table for replay and diagnostic access.
+
+- **[shipped] Stage-2 classifier (#37/#38).** Per-axis Ridge regression heads on Bio_ClinicalBERT embeddings — *not* a fine-tuned encoder; the encoder is the live HTTP service, the heads are tiny linear models trained against existing `compliance_scores` data. Hybrid Stage-1 audit detector (every N=10 online scores OR K=24h, whichever fires first); persists per-axis MAE + Spearman ρ to `audit_runs`. Online inference cost: 1 HTTP embed + microsecond linear forward pass per call. Optional MLP heads (#45) and rubric-label diagnostic (#46) deferred pending real-data analysis of weak axes.
+
+- **[shipped] GP layer (#39/#40).** sklearn `GaussianProcessRegressor` over `(supervised_text_embedding, aggregate_score)` pairs, with three pieces of preprocessing the original spec did not anticipate:
+  - **StandardScaler** input normalization so length-scale optimization settles inside its bounds.
+  - **PCA reduction to 50 dimensions** before the GP sees the data — raw 768-dim Bio_ClinicalBERT space has too narrow a pairwise-distance band for an RBF kernel to discriminate (curse of dimensionality).
+  - **Noise term α = 10⁻²** to absorb judge variance on duplicate-text training rows; without it the kernel matrix is near-singular and the optimizer fails.
+
+  The non-stationary kernel originally specified in §5.5.5 of the architecture doc is deferred to v2; the stationary RBF + PCA stack produces well-conditioned fits with meaningful posterior variance on real data.
+
+  **Probe target proposer:** ranks candidates by `score = posterior_std × max(0, 1 − 2·|0.5 − posterior_mean|)` — the original `× |0.5 − mean|` formula was inverted relative to its stated "near the boundary" intent. Candidates are seeded by **quartile-stratified sampling** from training observations (equal share per score quartile), since real compliance distributions are heavily skewed toward compliance and uniform sampling otherwise starves the violation boundary of candidate density.
+
+- **[shipped] K-NN exemplar probe synthesis (#41/#42/#43).** Replaces the gradient-guided synthesis the original spec described (which depends on the Riemannian metric, also deferred). Given a GP-proposed target embedding: find K=5 nearest library anchors by cosine similarity, prompt a generator LLM with those exemplars to synthesize a new scenario, re-embed and verify cosine ≥ τ (default 0.7), gate through an LLM-as-validator (configurable model so the gate can run cheap at scale), persist as `synthesized_probes`. Scoring is configurable: Stage-1 LLM judge by default, Stage-2 classifier via `--scorer classifier` for cheap online scoring at scale.
+
+- **[deferred] Riemannian metric learner.** Small MLP trained on Jacobians from Phase 2; maps compliance position → local metric tensor; upgrade all distance computations.
+
+- **[deferred] Decoupling and curvature signals.** Covariance structure monitoring between policy axes; curvature monitoring on the learned metric. Depends on the Riemannian metric.
+
+- **[deferred] Gradient-guided probe generation.** Adds gradient computation in embedding space to the K-NN exemplar approach. Depends on the Riemannian metric for the gradient direction.
+
+- **[deferred] Non-stationary kernel for the GP.** Lets the kernel carry semantic-region distinctions (e.g., narrow in the prescriptive-action region, wide in the safe-referral region) directly, rather than relying on PCA to compress the dimensionality. Useful when the v1 stationary + PCA stack proves insufficient on a downstream task; not currently a bottleneck.
 
 ---
 

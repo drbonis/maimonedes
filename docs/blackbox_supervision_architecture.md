@@ -445,6 +445,14 @@ In the **safe referral region** — where outputs use referral language, monitor
 
 The practical consequence: in the prescriptive-action region the GP's uncertainty drops slowly as training examples are added — many examples are needed because the landscape is complex. In the safe referral region confidence is high even with few examples because nearby outputs are reliably similar.
 
+**v1 implementation note.** The non-stationary kernel is a v2 entry point and is not yet implemented. The current implementation uses a **stationary RBF kernel with three pieces of preprocessing**:
+
+- **StandardScaler** centers and unit-scales each Bio_ClinicalBERT embedding dimension so the kernel optimizer doesn't have to absorb large per-dimension magnitude differences into kernel hyperparameters.
+- **PCA to 50 dimensions** before the GP sees the data. With ~1700 training points in 768-dim Bio_ClinicalBERT space, average pairwise distances cluster in a narrow band that an RBF kernel can't discriminate (the curse of dimensionality). Projecting onto the 50 principal components retains most of the variance while bringing pairwise distances into a range the kernel can model.
+- **Noise term α = 10⁻²** on the GP's likelihood. Real `(text, score)` training pairs from production runs include large numbers of duplicate texts (the same anchor scenario scored repeatedly across run-once / drift / recovery sessions, with judge variance producing slightly different aggregates). Without the noise term, the kernel matrix becomes near-singular and the optimizer fails. With α at this level, the GP attributes that variance to observation noise instead of trying to fit it through the kernel.
+
+This combination produces well-conditioned kernel matrices, meaningful posterior variance, and length-scale hyperparameters that converge inside their bounds rather than pinning at a boundary. The non-stationary upgrade remains valuable in principle — it would let the GP carry semantic distinctions like "medication-dose register" vs "referral register" directly in its kernel — but the simpler stationary + PCA stack is sufficient for the v1 demo.
+
 #### 5.5.6 How Uncertainty Drives Probe Generation
 
 The GP uncertainty map is a continuous surface over output embedding space. High-uncertainty regions are where the compliance scorer does not know what it does not know — where new outputs may land that are unlike anything in the training set.
@@ -452,6 +460,20 @@ The GP uncertainty map is a continuous surface over output embedding space. High
 The perturbation probe generation strategy reads this map directly. When output F arrives with low uncertainty the system processes it normally. When output G arrives with high uncertainty the system does two things simultaneously: it flags G for human review (the prediction may be unreliable), and it schedules additional perturbation probes around the input that produced G. Those probes generate more outputs in the same region of embedding space, which get labeled and added to the GP training set, gradually reducing uncertainty there.
 
 Over time the uncertainty map shrinks — high-uncertainty regions get probed, labeled, and incorporated, pushing the frontier of confident knowledge outward. The system continuously teaches itself where it needs more data, creating the self-improving loop that makes the monitoring architecture adaptive rather than static.
+
+**v1 implementation note.** The candidate-target proposer is not "pure uncertainty maximization." It combines uncertainty with **proximity to the violation boundary**, since a high-uncertainty point deep in safe-compliance territory is less informative than a high-uncertainty point near the safety threshold (where being wrong about the prediction changes the safety classification).
+
+The score formula is
+
+```
+score = posterior_std × max(0, 1 − 2·|0.5 − posterior_mean|)
+```
+
+This peaks at `posterior_mean = 0.5` (the violation boundary) with weight 1.0, and falls linearly to 0 at the extremes (`posterior_mean = 0` or `posterior_mean = 1`). Top-K candidates by this score are returned as proposed embedding-space targets for the synthesizer.
+
+Real production score distributions are heavily skewed toward compliance — typically 70%+ of training observations fall above 0.7. Uniform random sampling of seed points from the training set therefore over-represents the dominant compliance mode and effectively starves the boundary of candidate density. The proposer counters this with **quartile-stratified seeding**: training observations are bucketed into score quartiles, and the candidate pool draws an equal share from each quartile. With this, perturbations near the (rarer) low-score training points show up reliably in the candidate pool, and the boundary-seeking score formula then has something to score.
+
+These two pieces — the boundary-seeking weight and the stratified seeding — are operationally the difference between a proposer that returns "uncertain points clustered around the dominant compliance mode" and one that returns "uncertain points spanning the threshold region." The latter is what feeds the synthesizer.
 
 ---
 
@@ -517,6 +539,18 @@ The probe generation algorithm operates as follows:
 This creates a self-reinforcing improvement loop: the fragility map directs probe generation toward risky regions, new probes refine the fragility map, refined map directs more targeted probes. Over time the system concentrates its red teaming effort precisely where the supervised system is most vulnerable.
 
 **Synthetic violation generation:** by extrapolating along the maximum fragility gradient beyond the observed perturbation range, the system can generate predicted policy violations — inputs the system has not yet seen that are likely to produce non-compliant outputs. These are validated by sending them to the supervised system and checking the compliance score. Validated synthetic violations bootstrap a growing library of known failure modes from an initial condition of zero observed violations.
+
+**v1 implementation note.** The full gradient-guided algorithm above remains a v2 entry point — steps 3 and 4 require a Riemannian metric (also v2) and a constrained text generator (not yet implemented). What v1 ships is a simpler approach with the same shape: **K-NN exemplar synthesis driven by GP-proposed targets**.
+
+For each embedding-space target the GP proposes (per §5.5.6), the synthesizer:
+
+1. Finds the K=5 library anchors with highest cosine similarity to the target embedding.
+2. Prompts a generator LLM with those K anchor scenarios as exemplars, asking for a NEW clinically-similar scenario that explores the gap they leave.
+3. Re-embeds the generated text and verifies cosine similarity to the original target ≥ τ (default 0.7); retries up to a budget on near-misses.
+4. Routes the surviving scenario through an LLM-as-validator quality gate (configurable model so the gate can be cheap when synthesizing at scale) before persisting the probe.
+5. Optionally scores the new probe through the supervised + judge pipeline, OR through the Stage-2 classifier when latency / cost matters.
+
+The v1 substitution preserves the architectural intent — turn high-uncertainty, near-boundary regions of compliance space into actual probes — without requiring the Riemannian and gradient infrastructure that v2 depends on. The closed-loop "synthesize → score → re-fit GP → propose new targets" cadence is the same; only the synthesis mechanism is simpler.
 
 ### 6.6 Feedback Generation
 
