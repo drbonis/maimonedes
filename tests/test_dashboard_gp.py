@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 from alembic import command
 from alembic.config import Config
@@ -147,3 +148,74 @@ def test_gp_page_renders_scatter_and_targets_table(
 
     # At least one dataframe (the targets table) rendered.
     assert len(at.dataframe) >= 1
+
+
+# ---- _project_2d helper (UMAP / PCA fallback) ------------------------------
+
+
+def _load_gp_page_module(stub_name: str):
+    """Load 05_gp.py as a module so we can exercise its helpers in pytest.
+
+    Streamlit page filenames start with a digit, so a normal `import` won't
+    resolve them. We use `importlib.util.spec_from_file_location` and
+    tolerate the page's `_render()` side-effect failing without a
+    Streamlit runtime — the helper functions are still bound on the module.
+    """
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location(
+        stub_name,
+        str(GP_PAGE),
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[stub_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        # _render() raises without a ScriptRunContext; helpers are still
+        # bound on the module.
+        pass
+    return module
+
+
+def test_project_2d_uses_umap_when_available() -> None:
+    """With ≥ 16 points and umap-learn installed, _project_2d returns UMAP."""
+    pytest.importorskip("umap")
+    module = _load_gp_page_module("_gp_page_for_test_umap")
+
+    rng = np.random.default_rng(0)
+    combined = rng.normal(size=(40, 64))
+    coords, method = module._project_2d(combined)
+    assert coords.shape == (40, 2)
+    assert method == "UMAP"
+
+
+def test_project_2d_falls_back_to_pca_when_umap_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If umap import fails, _project_2d returns PCA — the dashboard
+    must keep working in environments without umap-learn."""
+    import sys
+
+    # Make the umap import raise ImportError for the duration of the test.
+    monkeypatch.setitem(sys.modules, "umap", None)
+    module = _load_gp_page_module("_gp_page_for_test_no_umap")
+
+    rng = np.random.default_rng(0)
+    combined = rng.normal(size=(40, 64))
+    coords, method = module._project_2d(combined)
+    assert coords.shape == (40, 2)
+    assert method == "PCA"
+
+
+def test_project_2d_falls_back_to_pca_when_too_few_points() -> None:
+    """UMAP needs ≥ n_neighbors+1 points; tiny stacks fall back to PCA."""
+    module = _load_gp_page_module("_gp_page_for_test_tiny")
+
+    rng = np.random.default_rng(0)
+    combined = rng.normal(size=(5, 64))  # < UMAP_N_NEIGHBORS + 1
+    coords, method = module._project_2d(combined)
+    assert coords.shape == (5, 2)
+    assert method == "PCA"

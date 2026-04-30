@@ -44,6 +44,7 @@ class GPSnapshot:
     fit_id: int
     points: list[GPScatterPoint] = field(default_factory=list)
     target_rows: list[dict] = field(default_factory=list)
+    projection_method: str = "PCA"  # "UMAP" or "PCA" — what produced `points`
 
 
 __all__ = ["GPFitSnapshot", "GPScatterPoint", "GPSnapshot"]

@@ -2,8 +2,14 @@
 
 Shows the embedding-space distribution of training data, the GP's
 proposed targets overlaid, and a side panel with the ranked targets.
-2D projection uses PCA from sklearn (UMAP would be nicer but adds
-numba — PCA is good enough for diagnostic intent).
+
+The 2D projection prefers UMAP (better local-neighborhood
+preservation, exposes clinical-domain clusters and
+compliance-gradient sub-structure that PCA washes out). Falls back
+to PCA when UMAP is unavailable or the point count is too small for
+UMAP's `n_neighbors=15` default. The PCA-only modeling layer in
+`monitor.gp_layer` is unaffected — that one needs out-of-sample
+transform + inverse transform, which UMAP can't reliably provide.
 """
 from __future__ import annotations
 
@@ -28,6 +34,46 @@ PAGE_TITLE = "GP — Phase 5"
 EMPTY_STATE_MSG = (
     "No GP fits recorded yet. Run `maimonedes fit-gp` to populate this dashboard."
 )
+UMAP_N_NEIGHBORS = 15  # UMAP requires at least n_neighbors+1 points to fit
+
+
+def _project_2d(combined: np.ndarray) -> tuple[np.ndarray, str]:
+    """Project the combined embedding stack to 2D for the scatter plot.
+
+    Tries UMAP first (preserves local neighborhood structure on
+    Bio_ClinicalBERT embeddings far better than PCA's variance-axis
+    projection). Falls back to PCA when:
+    - `umap-learn` is not installed in the environment, or
+    - the combined matrix has too few points for UMAP's default
+      `n_neighbors=15` neighborhood.
+
+    Returns `(coords_n_x_2, method_label)` where `method_label` is
+    `"UMAP"` or `"PCA"` and gets shown in the page caption so the
+    operator knows which projection produced the scatter.
+    """
+    n_points = combined.shape[0]
+    use_umap = n_points >= UMAP_N_NEIGHBORS + 1
+    if use_umap:
+        try:
+            import umap  # noqa: PLC0415 — gated import for optional dep
+
+            reducer = umap.UMAP(
+                n_components=2,
+                n_neighbors=UMAP_N_NEIGHBORS,
+                min_dist=0.1,
+                random_state=0,
+            )
+            coords = reducer.fit_transform(combined)
+            return coords, "UMAP"
+        except ImportError:
+            pass
+    n_components = min(2, combined.shape[1], max(1, n_points - 1))
+    pca = PCA(n_components=2 if n_components >= 2 else 1)
+    coords = pca.fit_transform(combined)
+    if coords.shape[1] == 1:
+        # Pad so plotting code can rely on (x, y).
+        coords = np.hstack([coords, np.zeros_like(coords)])
+    return coords, "PCA"
 
 
 @st.cache_data(ttl=10)
@@ -101,19 +147,14 @@ def _cached_snapshot(fit_id: int) -> GPSnapshot | None:
         [gp.library_anchor_embeddings[k] for k in library_keys]
     ) if library_keys else np.zeros((0, gp.feature_dim))
 
-    # Stack for one PCA fit so the projections share axes.
+    # Stack for one fit so all three sources share a common 2D basis.
     stack: list[np.ndarray] = [gp.training_embeddings]
     if target_embeddings.shape[0]:
         stack.append(target_embeddings)
     if library_array.shape[0]:
         stack.append(library_array)
     combined = np.vstack(stack)
-    n_components = min(2, combined.shape[1], max(1, combined.shape[0] - 1))
-    pca = PCA(n_components=2 if n_components >= 2 else 1)
-    coords = pca.fit_transform(combined)
-    if coords.shape[1] == 1:
-        # Pad so plotting code can rely on (x, y).
-        coords = np.hstack([coords, np.zeros_like(coords)])
+    coords, projection_method = _project_2d(combined)
 
     points: list[GPScatterPoint] = []
     n_train = gp.training_embeddings.shape[0]
@@ -186,7 +227,12 @@ def _cached_snapshot(fit_id: int) -> GPSnapshot | None:
             }
         )
 
-    return GPSnapshot(fit_id=fit_id, points=points, target_rows=target_rows)
+    return GPSnapshot(
+        fit_id=fit_id,
+        points=points,
+        target_rows=target_rows,
+        projection_method=projection_method,
+    )
 
 
 def _build_figure(snapshot: GPSnapshot) -> go.Figure:
@@ -280,10 +326,10 @@ def _render() -> None:
 
     st.plotly_chart(_build_figure(snapshot), use_container_width=True)
     st.caption(
-        f"PCA projection of training embeddings (red = compliant, "
-        f"green = compliant; oh wait — red ↔ green is the aggregate "
-        f"colormap). Library anchors as black diamonds; proposed targets "
-        f"as stars colored by target score."
+        f"{snapshot.projection_method} projection of training embeddings "
+        f"(aggregate score colormap, low → high). Library anchors as "
+        f"black diamonds; proposed targets as stars colored by target "
+        f"score."
     )
 
     st.subheader(f"Top-{len(snapshot.target_rows)} proposed targets")
