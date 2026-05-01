@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import scipy.linalg
+import scipy.optimize
 from sklearn.decomposition import PCA
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Kernel, RBF
@@ -150,6 +152,211 @@ def _default_kernel() -> Kernel:
     )
 
 
+# ---- Non-stationary Gibbs kernel (issue #49) -------------------------------
+#
+# A Gibbs kernel with position-dependent length-scale ℓ(x):
+#
+#   k(x, y) = σ² · (2 ℓ(x) ℓ(y) / (ℓ(x)² + ℓ(y)²))^(d/2)
+#                · exp(-‖x - y‖² / (ℓ(x)² + ℓ(y)²))
+#
+#   ℓ(x) = exp(a + b · x[0] + c · x[1])
+#
+# Three degrees of freedom in ℓ — a constant (a) and log-linear slopes
+# along the first two coordinates (b, c). x[0] / x[1] are interpreted
+# as the leading PCA components in the GP's input space, matching the
+# §5.5.5 prediction that compliance geometry is most anisotropic along
+# the principal-variance axes.
+#
+# Hyperparameters (σ, a, b, c) are NOT exposed via sklearn's `Hyperparameter`
+# protocol — sklearn's L-BFGS-B path requires positive bounds and analytic
+# kernel-gradient code. Both are awkward here (a, b, c are real-valued; the
+# Gibbs gradient is messy). Instead we run scipy's L-BFGS-B over the GP log-
+# marginal-likelihood externally and pass the optimized kernel to
+# GaussianProcessRegressor with `optimizer=None`.
+
+
+class GibbsKernel(Kernel):
+    """Non-stationary Gibbs kernel; see module-level explanation."""
+
+    def __init__(
+        self,
+        sigma: float = 1.0,
+        a: float = 0.0,
+        b: float = 0.0,
+        c: float = 0.0,
+        sigma_bounds: tuple[float, float] = (1e-3, 1e3),
+        a_bounds: tuple[float, float] = (-3.0, 3.0),
+        b_bounds: tuple[float, float] = (-1.0, 1.0),
+        c_bounds: tuple[float, float] = (-1.0, 1.0),
+    ) -> None:
+        self.sigma = sigma
+        self.a = a
+        self.b = b
+        self.c = c
+        self.sigma_bounds = sigma_bounds
+        self.a_bounds = a_bounds
+        self.b_bounds = b_bounds
+        self.c_bounds = c_bounds
+
+    def is_stationary(self) -> bool:
+        return False
+
+    def _length_scale(self, X: np.ndarray) -> np.ndarray:
+        """ℓ(x) = exp(a + b · x[0] + c · x[1]). Falls back gracefully for d<2."""
+        d = X.shape[1]
+        log_ell = np.full(X.shape[0], self.a, dtype=float)
+        if d >= 1:
+            log_ell = log_ell + self.b * X[:, 0]
+        if d >= 2:
+            log_ell = log_ell + self.c * X[:, 1]
+        return np.exp(log_ell)
+
+    def __call__(
+        self,
+        X: np.ndarray,
+        Y: np.ndarray | None = None,
+        eval_gradient: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+        if eval_gradient:
+            # Hyperparameters are externally fitted — sklearn shouldn't
+            # request the gradient path. If it ever does, fail loud.
+            raise NotImplementedError(
+                "GibbsKernel hyperparameters are externally optimized; "
+                "instantiate a GaussianProcessRegressor with optimizer=None "
+                "so sklearn doesn't request kernel gradients."
+            )
+        X_arr = np.asarray(X, dtype=float)
+        Y_arr = X_arr if Y is None else np.asarray(Y, dtype=float)
+        d = X_arr.shape[1]
+
+        ell_X = self._length_scale(X_arr)  # (n,)
+        ell_Y = ell_X if Y is None else self._length_scale(Y_arr)  # (m,)
+
+        ell_X_sq = ell_X[:, None] ** 2  # (n, 1)
+        ell_Y_sq = ell_Y[None, :] ** 2  # (1, m)
+        s = ell_X_sq + ell_Y_sq  # (n, m)
+        prefactor = (2.0 * ell_X[:, None] * ell_Y[None, :] / s) ** (d / 2.0)
+
+        # ‖x - y‖² without materializing the (n, m, d) tensor.
+        Xsq = (X_arr ** 2).sum(axis=1)
+        Ysq = (Y_arr ** 2).sum(axis=1)
+        sqdist = Xsq[:, None] + Ysq[None, :] - 2.0 * (X_arr @ Y_arr.T)
+        np.maximum(sqdist, 0.0, out=sqdist)  # numerical floor
+
+        return (self.sigma ** 2) * prefactor * np.exp(-sqdist / s)
+
+    def diag(self, X: np.ndarray) -> np.ndarray:
+        # k(x, x) = σ² · (2 ℓ²/2 ℓ²)^(d/2) · exp(0) = σ²
+        return np.full(np.asarray(X).shape[0], self.sigma ** 2, dtype=float)
+
+    def __repr__(self) -> str:
+        return (
+            f"GibbsKernel(sigma={self.sigma:.4g}, a={self.a:.4g}, "
+            f"b={self.b:.4g}, c={self.c:.4g})"
+        )
+
+
+def non_stationary_kernel(
+    *,
+    sigma: float = 1.0,
+    a: float = 0.0,
+    b: float = 0.0,
+    c: float = 0.0,
+) -> Kernel:
+    """Return a Gibbs kernel with the supplied initial hyperparameters.
+
+    Hyperparameters are externally optimized by `_fit_gibbs_hyperparameters`
+    when this kernel is used inside `fit_compliance_gp(..., kernel="non_stationary")`.
+    """
+    return GibbsKernel(sigma=sigma, a=a, b=b, c=c)
+
+
+def _gibbs_log_marginal_likelihood(
+    theta: np.ndarray,
+    X: np.ndarray,
+    y_normalized: np.ndarray,
+    alpha: float,
+) -> float:
+    """Negative log-marginal-likelihood for L-BFGS-B (minimization)."""
+    sigma, a, b, c = theta
+    kernel = GibbsKernel(sigma=float(sigma), a=float(a), b=float(b), c=float(c))
+    K = kernel(X) + alpha * np.eye(X.shape[0])
+    try:
+        L = np.linalg.cholesky(K)
+    except np.linalg.LinAlgError:
+        return 1e10  # PD failure → reject this hyperparameter set
+    alpha_vec = scipy.linalg.cho_solve((L, True), y_normalized)
+    n = X.shape[0]
+    lml = (
+        -0.5 * float(y_normalized @ alpha_vec)
+        - float(np.log(np.diag(L)).sum())
+        - 0.5 * n * float(np.log(2.0 * np.pi))
+    )
+    return -lml
+
+
+def _fit_gibbs_hyperparameters(
+    X: np.ndarray,
+    y_normalized: np.ndarray,
+    *,
+    alpha: float,
+    n_restarts: int,
+    seed: int,
+) -> tuple[float, float, float, float, float]:
+    """Maximize LML over (σ, a, b, c) with L-BFGS-B + multi-start.
+
+    Returns (sigma, a, b, c, log_marginal_likelihood).
+    """
+    rng = np.random.default_rng(seed)
+    bounds = [(0.01, 100.0), (-3.0, 3.0), (-1.0, 1.0), (-1.0, 1.0)]
+
+    # First restart is the deterministic starting point (stationary-RBF-ish).
+    initial = [np.array([1.0, 0.0, 0.0, 0.0], dtype=float)]
+    for _ in range(n_restarts):
+        initial.append(
+            np.array(
+                [
+                    rng.uniform(0.5, 5.0),
+                    rng.uniform(-1.0, 1.0),
+                    rng.uniform(-0.5, 0.5),
+                    rng.uniform(-0.5, 0.5),
+                ],
+                dtype=float,
+            )
+        )
+
+    best_theta: np.ndarray | None = None
+    best_neg_lml = np.inf
+    for theta_0 in initial:
+        try:
+            result = scipy.optimize.minimize(
+                _gibbs_log_marginal_likelihood,
+                x0=theta_0,
+                args=(X, y_normalized, alpha),
+                method="L-BFGS-B",
+                bounds=bounds,
+            )
+        except Exception as exc:
+            log.warning(
+                "gp_layer.gibbs_optimizer_failed",
+                extra={"theta_0": theta_0.tolist(), "error": str(exc)},
+            )
+            continue
+        if not np.isfinite(result.fun):
+            continue
+        if result.fun < best_neg_lml:
+            best_neg_lml = float(result.fun)
+            best_theta = np.asarray(result.x, dtype=float)
+
+    if best_theta is None or not np.isfinite(best_neg_lml):
+        raise RuntimeError(
+            "all GibbsKernel hyperparameter restarts failed to converge"
+        )
+
+    sigma, a, b, c = best_theta.tolist()
+    return float(sigma), float(a), float(b), float(c), -best_neg_lml
+
+
 # sklearn's default `alpha=1e-10` assumes near-perfect observations.
 # Real compliance_scores have substantial duplicate-text rows
 # (anchors scored repeatedly across run-once / drift / recovery)
@@ -167,12 +374,73 @@ DEFAULT_ALPHA = 1e-2
 DEFAULT_PCA_COMPONENTS = 50
 
 
+def _fit_gp_arrays(
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    kernel: Kernel | str | None,
+    alpha: float = DEFAULT_ALPHA,
+    n_restarts_optimizer: int = 5,
+) -> GaussianProcessRegressor:
+    """Fit a GP given pre-computed input arrays and a kernel selector.
+
+    Split out from `fit_compliance_gp` so tests can drive the kernel
+    branching without seeding the database / embed pipeline.
+    """
+    if isinstance(kernel, str):
+        if kernel == "stationary":
+            kernel_obj: Kernel = _default_kernel()
+            use_external = False
+        elif kernel == "non_stationary":
+            # Externally optimize on the same y normalization sklearn
+            # would apply with normalize_y=True, so the resulting
+            # log_marginal_likelihood_value_ is comparable to the
+            # stationary path's.
+            y_arr = np.asarray(y, dtype=float)
+            y_mean = float(np.mean(y_arr))
+            y_std = float(np.std(y_arr)) or 1.0
+            y_norm = (y_arr - y_mean) / y_std
+            sigma_opt, a_opt, b_opt, c_opt, _ = _fit_gibbs_hyperparameters(
+                X,
+                y_norm,
+                alpha=alpha,
+                n_restarts=n_restarts_optimizer,
+                seed=0,
+            )
+            kernel_obj = GibbsKernel(
+                sigma=sigma_opt, a=a_opt, b=b_opt, c=c_opt
+            )
+            use_external = True
+        else:
+            raise ValueError(
+                f"unknown kernel selector {kernel!r}; "
+                "use 'stationary', 'non_stationary', or a Kernel instance"
+            )
+    elif kernel is None:
+        kernel_obj = _default_kernel()
+        use_external = False
+    else:
+        kernel_obj = kernel
+        use_external = False
+
+    gp = GaussianProcessRegressor(
+        kernel=kernel_obj,
+        normalize_y=True,
+        n_restarts_optimizer=0 if use_external else n_restarts_optimizer,
+        optimizer=None if use_external else "fmin_l_bfgs_b",
+        alpha=alpha,
+        random_state=0,
+    )
+    gp.fit(X, y)
+    return gp
+
+
 def fit_compliance_gp(
     *,
     embed_client: EmbedClient,
     policy: Policy,
     embedding_model: str | None = None,
-    kernel: Kernel | None = None,
+    kernel: Kernel | str | None = None,
     min_samples: int = 20,
     library_anchor_texts: dict[str, str] | None = None,
     n_restarts_optimizer: int = 5,
@@ -184,6 +452,13 @@ def fit_compliance_gp(
     `library_anchor_texts={anchor_id: scenario_text}` is embedded at fit
     time and cached on the artefact so the GP dashboard can do nearest-
     library-anchor lookups without re-embedding the curated probes.
+
+    `kernel` accepts a sklearn `Kernel` instance, the string
+    `"stationary"` (default) for the v1 ConstantKernel*RBF, or
+    `"non_stationary"` for the Gibbs kernel from issue #49 — fitted
+    via external scipy L-BFGS-B since its hyperparameters are
+    real-valued and can't be expressed as positive sklearn
+    hyperparameters.
     """
     points = _fetch_training_points(policy.id)
     if len(points) < min_samples:
@@ -225,14 +500,13 @@ def fit_compliance_gp(
     else:
         X_gp = X_scaled
 
-    gp = GaussianProcessRegressor(
-        kernel=kernel or _default_kernel(),
-        normalize_y=True,
-        n_restarts_optimizer=n_restarts_optimizer,
+    gp = _fit_gp_arrays(
+        X_gp,
+        y,
+        kernel=kernel,
         alpha=alpha,
-        random_state=0,
+        n_restarts_optimizer=n_restarts_optimizer,
     )
-    gp.fit(X_gp, y)
 
     library_anchors: dict[str, list[float]] = {}
     library_text_payload: dict[str, str] = {}
@@ -393,10 +667,81 @@ def propose_targets(
     ]
 
 
+@dataclass(frozen=True)
+class QuartileDiagnostic:
+    """Per-PCA-1 quartile summary for the non-stationary kernel diagnostic."""
+
+    quartile: int  # 1 .. 4
+    n: int
+    pc1_mean: float
+    ell_mean: float  # mean ℓ(x) across this quartile's training points
+    sigma_pred_mean: float  # mean GP posterior std across this quartile
+    score_var: float  # empirical variance of training aggregates in this quartile
+
+
+def quartile_diagnostics(gp: ComplianceGP) -> list[QuartileDiagnostic]:
+    """Per-PCA-1-quartile summary of length-scale and posterior uncertainty.
+
+    Splits training points into PC1 quartiles and reports mean ℓ(x), mean
+    posterior std, and the empirical score variance per quartile. The §5.5.5
+    prediction is that the highest-score-variance quartile (prescriptive
+    region) gets the smallest ℓ and the lowest-variance quartile (referral
+    region) gets the largest ℓ — only meaningful when the kernel is
+    `GibbsKernel`. For a stationary kernel `ell_mean` is constant.
+    """
+    if gp.training_embeddings.size == 0:
+        return []
+
+    X_gp = gp._to_gp_space(gp.training_embeddings)
+    pc1 = X_gp[:, 0] if X_gp.shape[1] >= 1 else np.zeros(X_gp.shape[0])
+    aggregates = gp.training_aggregates
+
+    if isinstance(gp.gp.kernel_, GibbsKernel):
+        ell_per_point = gp.gp.kernel_._length_scale(X_gp)
+    else:
+        # Best-effort fallback for non-Gibbs kernels.
+        length_scale = getattr(gp.gp.kernel_, "length_scale", 1.0)
+        if isinstance(length_scale, np.ndarray):
+            length_scale = float(np.mean(length_scale))
+        ell_per_point = np.full(X_gp.shape[0], float(length_scale))
+
+    _, sigma_pred = gp.gp.predict(X_gp, return_std=True)
+
+    # Rank-based bucketing — guarantees 4 quartiles even when PC1 has
+    # heavy ties (e.g. low-dim deterministic test embeddings).
+    n = pc1.shape[0]
+    order = np.argsort(pc1, kind="stable")
+    rank = np.empty(n, dtype=int)
+    rank[order] = np.arange(n)
+    quartile_idx = np.minimum(rank * 4 // max(n, 1), 3)
+
+    out: list[QuartileDiagnostic] = []
+    for q in range(4):
+        mask = quartile_idx == q
+        n_q = int(mask.sum())
+        if n_q == 0:
+            continue
+        out.append(
+            QuartileDiagnostic(
+                quartile=q + 1,
+                n=n_q,
+                pc1_mean=float(np.mean(pc1[mask])),
+                ell_mean=float(np.mean(ell_per_point[mask])),
+                sigma_pred_mean=float(np.mean(sigma_pred[mask])),
+                score_var=float(np.var(aggregates[mask])),
+            )
+        )
+    return out
+
+
 __all__ = [
     "ComplianceGP",
     "GPTarget",
+    "GibbsKernel",
+    "QuartileDiagnostic",
     "TrainingPoint",
     "fit_compliance_gp",
+    "non_stationary_kernel",
     "propose_targets",
+    "quartile_diagnostics",
 ]

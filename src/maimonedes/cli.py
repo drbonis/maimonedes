@@ -589,13 +589,33 @@ def fit_gp_cmd(
         "--replay",
         help="Use the EmbedClient replay cache (free re-runs once embeddings are recorded).",
     ),
+    kernel: str = typer.Option(
+        "stationary",
+        "--kernel",
+        help="'stationary' (default RBF) or 'non_stationary' (Gibbs kernel, issue #49).",
+    ),
+    diagnose: bool = typer.Option(
+        False,
+        "--diagnose",
+        help="Print per-PCA-1-quartile ℓ / σ_pred / score-variance summary after the fit.",
+    ),
 ) -> None:
     """Fit a GP over (embedding, aggregate) pairs from compliance_scores."""
     from datetime import datetime, timezone
 
     from maimonedes.llm.recording_embed_client import RecordingEmbedClient
-    from maimonedes.monitor.gp_layer import fit_compliance_gp
+    from maimonedes.monitor.gp_layer import (
+        fit_compliance_gp,
+        quartile_diagnostics,
+    )
     from maimonedes.storage.gp_fits import record_gp_fit
+
+    if kernel not in {"stationary", "non_stationary"}:
+        typer.echo(
+            f"unknown --kernel {kernel!r}; expected 'stationary' or 'non_stationary'",
+            err=True,
+        )
+        raise typer.Exit(code=5)
 
     try:
         policy = load_policy(policy_path, rubric_path)
@@ -620,6 +640,7 @@ def fit_gp_cmd(
             embedding_model=settings.clinicalbert_model,
             min_samples=min_samples,
             library_anchor_texts={a.id: a.scenario for a in anchors},
+            kernel=kernel,
         )
     except ValueError as exc:
         typer.echo(f"GP fit failed: {exc}", err=True)
@@ -646,6 +667,25 @@ def fit_gp_cmd(
         f"log_marginal_likelihood={gp.log_marginal_likelihood:.3f}"
     )
     typer.echo(f"  kernel={gp.kernel_repr}")
+
+    if diagnose:
+        rows = quartile_diagnostics(gp)
+        if not rows:
+            typer.echo("  (no training points; nothing to diagnose)")
+        else:
+            typer.echo(
+                "  --- per-PCA-1 quartile diagnostic "
+                "(expect ℓ smaller where score_var is larger) ---"
+            )
+            typer.echo(
+                "  Q  n     pc1_mean   ell_mean   sigma_pred  score_var"
+            )
+            for r in rows:
+                typer.echo(
+                    f"  Q{r.quartile} {r.n:<4d}  "
+                    f"{r.pc1_mean:>+8.3f}  {r.ell_mean:>8.4f}  "
+                    f"{r.sigma_pred_mean:>9.4f}  {r.score_var:>9.4f}"
+                )
 
 
 @app.command("propose-targets")
