@@ -297,27 +297,74 @@ def jacobian_for_anchor(anchor_id: str) -> Jacobian | None:
 
 
 def _all_anchor_ids_with_baseline() -> list[str]:
+    """Curated-anchor parents only — synthesized probes use a sibling helper."""
     with get_session() as session:
         return list(
             session.execute(
                 select(ComplianceScoreRow.anchor_id)
-                .where(ComplianceScoreRow.probe_role == "anchor")
+                .where(
+                    ComplianceScoreRow.probe_role == "anchor",
+                    ComplianceScoreRow.synthesized_probe_id.is_(None),
+                )
                 .distinct()
             ).scalars().all()
         )
 
 
-def aggregated_fragility() -> FragilityTable:
-    """Mean Δ across all anchors, indexed by (perturbation_kind, column).
+def _synthesized_probe_ids_with_baseline() -> list[int]:
+    """Synthesized parents that have at least one anchor-baseline score.
 
-    Each (kind, column) cell is the mean over (anchor × perturbation-
-    of-that-kind), where each anchor's contribution is its own
+    Mirrors `_all_anchor_ids_with_baseline` but scoped to rows with
+    `synthesized_probe_id` set. The Jacobian computation needs a
+    baseline against which to compute Δs; without one the synthesized
+    parent's perturbations are excluded from aggregated fragility (and
+    a structured warning is logged).
+    """
+    with get_session() as session:
+        ids = list(
+            session.execute(
+                select(ComplianceScoreRow.synthesized_probe_id)
+                .where(
+                    ComplianceScoreRow.probe_role == "anchor",
+                    ComplianceScoreRow.synthesized_probe_id.is_not(None),
+                )
+                .distinct()
+            ).scalars().all()
+        )
+        return [int(i) for i in ids if i is not None]
+
+
+def jacobian_for_synthesized_probe(probe_id: int) -> Jacobian | None:
+    """Return the per-synthesized-probe Jacobian, or None if no baseline.
+
+    Mirrors `jacobian_for_anchor` exactly. The result's `anchor_id`
+    field is `f"synth-{probe_id}"` so consumers (dashboard, CSV
+    exports) can disambiguate library vs synthesized parents on
+    a single column.
+    """
+    from maimonedes.experiments.perturbation_session import synth_anchor_id
+
+    namespaced = synth_anchor_id(probe_id)
+    return jacobian_for_anchor(namespaced)
+
+
+def aggregated_fragility(
+    *, include_synthesized: bool = True
+) -> FragilityTable:
+    """Mean Δ across all parents, indexed by (perturbation_kind, column).
+
+    Each (kind, column) cell is the mean over (parent × perturbation-
+    of-that-kind), where each parent's contribution is its own
     *replicate-mean* Δ for that column. The reported `std_delta` is
-    the between-anchor std of those means; the within-anchor replicate
-    std is preserved at the per-anchor Jacobian level.
+    the between-parent std of those means; the within-parent replicate
+    std is preserved at the per-parent Jacobian level.
 
-    Anchors without a baseline are skipped (logged at WARNING) so the
+    Parents without a baseline are skipped (logged at WARNING) so the
     aggregate stays honest.
+
+    `include_synthesized=True` (default) folds synthesized-probe
+    Jacobians into the aggregate. Pass `False` to isolate the curated
+    library — the original Phase 2 fragility comparison.
     """
     accum: dict[tuple[str, str], list[float]] = {}
     columns_seen: set[str] = set()
@@ -334,6 +381,19 @@ def aggregated_fragility() -> FragilityTable:
                 accum.setdefault(
                     (row.perturbation_kind, column), []
                 ).append(delta)
+
+    if include_synthesized:
+        for probe_id in _synthesized_probe_ids_with_baseline():
+            jac = jacobian_for_synthesized_probe(probe_id)
+            if jac is None:
+                continue
+            columns_seen.update(jac.columns)
+            for row in jac.rows:
+                kinds_seen.add(row.perturbation_kind)
+                for column, delta in row.deltas.items():
+                    accum.setdefault(
+                        (row.perturbation_kind, column), []
+                    ).append(delta)
 
     cells = []
     for (kind, column), deltas in sorted(accum.items()):
@@ -358,13 +418,22 @@ def aggregated_fragility() -> FragilityTable:
     )
 
 
-def all_jacobians() -> dict[str, Jacobian]:
-    """Compute the per-anchor Jacobian for every anchor with a baseline."""
+def all_jacobians(*, include_synthesized: bool = True) -> dict[str, Jacobian]:
+    """Per-parent Jacobian for every parent that has a baseline.
+
+    Curated anchors keep their literal id (e.g. `A1`); synthesized
+    parents land in the dict under `f"synth-{probe_id}"`.
+    """
     out: dict[str, Jacobian] = {}
     for anchor_id in _all_anchor_ids_with_baseline():
         jac = jacobian_for_anchor(anchor_id)
         if jac is not None:
             out[anchor_id] = jac
+    if include_synthesized:
+        for probe_id in _synthesized_probe_ids_with_baseline():
+            jac = jacobian_for_synthesized_probe(probe_id)
+            if jac is not None:
+                out[jac.anchor_id] = jac
     return out
 
 
@@ -377,4 +446,5 @@ __all__ = [
     "aggregated_fragility",
     "all_jacobians",
     "jacobian_for_anchor",
+    "jacobian_for_synthesized_probe",
 ]

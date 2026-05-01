@@ -1102,10 +1102,21 @@ def _print_perturbation_summary(
 def perturb_cmd(
     anchor_id: str = typer.Argument(
         None,
-        help="Anchor id (e.g. A3). Omit when --all-anchors is passed.",
+        help="Anchor id (e.g. A3). Omit when --all-anchors / --synthesized is passed.",
     ),
     all_anchors: bool = typer.Option(
         False, "--all-anchors", help="Sweep A1..A8 sequentially."
+    ),
+    synthesized: int = typer.Option(
+        None,
+        "--synthesized",
+        help="Run perturbations against synthesized_probes row #N "
+        "(mutually exclusive with anchor-id and --all-anchors).",
+    ),
+    all_synthesized: bool = typer.Option(
+        False,
+        "--all-synthesized",
+        help="Sweep every approved row in synthesized_probes (skip rejected).",
     ),
     kinds: str = typer.Option(
         ",".join(ALL_KINDS),
@@ -1149,9 +1160,23 @@ def perturb_cmd(
         DEFAULT_PROFESSION_PATH, "--profession-path"
     ),
 ) -> None:
-    """Generate, run, and score a perturbation cloud for one anchor (or all)."""
-    if not all_anchors and anchor_id is None:
-        raise typer.BadParameter("Provide an anchor id or pass --all-anchors.")
+    """Generate, run, and score a perturbation cloud for one parent.
+
+    Parent kinds:
+    - curated anchor (positional `anchor-id` or `--all-anchors`)
+    - synthesized probe (`--synthesized <id>` or `--all-synthesized`)
+    """
+    selectors = [
+        anchor_id is not None,
+        all_anchors,
+        synthesized is not None,
+        all_synthesized,
+    ]
+    if sum(1 for s in selectors if s) != 1:
+        raise typer.BadParameter(
+            "Pass exactly one of: <anchor-id>, --all-anchors, "
+            "--synthesized <id>, --all-synthesized."
+        )
     if replicates < 1:
         raise typer.BadParameter("--replicates must be >= 1.")
     if replicates > 1 and replay:
@@ -1193,47 +1218,114 @@ def perturb_cmd(
         typer.echo(f"invalid configuration: {exc}", err=True)
         raise typer.Exit(code=5) from exc
 
-    target_ids: list[str] = (
-        [a.id for a in anchors] if all_anchors else [anchor_id or ""]
-    )
+    # Build target list: either curated anchor ids OR synthesized
+    # probe ids (using namespaced anchor labels for the print path).
+    synth_targets: list[int] = []
+    if synthesized is not None:
+        synth_targets = [synthesized]
+    elif all_synthesized:
+        from maimonedes.storage.synthesized_probes import list_synthesized_probes
+
+        approved = list_synthesized_probes(
+            policy_id=policy.id, quality_status="approved"
+        )
+        synth_targets = [p.id for p in approved if p.id is not None]
+        if not synth_targets:
+            typer.echo(
+                "no approved synthesized probes for this policy; "
+                "run `maimonedes synthesize-probes` first.",
+                err=True,
+            )
+            raise typer.Exit(code=4)
+
+    target_ids: list[str]
+    if synth_targets:
+        target_ids = [f"synth-{i}" for i in synth_targets]
+    elif all_anchors:
+        target_ids = [a.id for a in anchors]
+    else:
+        target_ids = [anchor_id or ""]
+
     rep_suffix = f"; replicates={replicates}" if replicates > 1 else ""
     typer.echo(
-        f"running perturbations on {len(target_ids)} anchor(s); "
+        f"running perturbations on {len(target_ids)} parent(s); "
         f"kinds={','.join(kinds_list)}{rep_suffix}"
     )
 
     failures = 0
-    for i, aid in enumerate(target_ids, start=1):
-        if all_anchors:
-            typer.echo(f"[{i}/{len(target_ids)}] anchor={aid}")
-        else:
-            typer.echo(f"anchor={aid}")
-        try:
-            outcomes = run_perturbations(
-                aid,
-                policy=policy,
-                anchors=anchors,
-                supervised_client=backend,  # type: ignore[arg-type]
-                judge_client=backend,  # type: ignore[arg-type]
-                generators=generators,
-                supervised_model=settings.ollama_supervised_model,
-                judge_model=settings.ollama_judge_model,
-                replay=replay,
-                on_outcome=_stream_outcome,
-                on_generation=_stream_generation,
-                replicates=replicates,
-            )
-        except KeyError as exc:
-            typer.echo(f"unknown anchor id: {exc}", err=True)
-            raise typer.Exit(code=4) from exc
-        except ValueError as exc:
-            typer.echo(f"invalid configuration: {exc}", err=True)
-            raise typer.Exit(code=5) from exc
-        except LLMError as exc:
-            typer.echo(f"LLM backend error on {aid}: {exc}", err=True)
-            failures += 1
-            continue
-        _print_perturbation_summary(aid, outcomes)
+    if synth_targets:
+        from maimonedes.storage.synthesized_probes import get_synthesized_probe
+
+        DEMOGRAPHIC_HINT = "i'm "  # we expect "Hi, I'm John, ..." patterns
+        for i, sid in enumerate(synth_targets, start=1):
+            label = f"synth-{sid}"
+            typer.echo(f"[{i}/{len(synth_targets)}] {label}")
+            probe = get_synthesized_probe(sid)
+            if probe is not None and DEMOGRAPHIC_HINT not in probe.scenario.lower():
+                typer.echo(
+                    f"warning: synthesized probe {sid} has no demographic "
+                    "preamble; rule-based generators may produce zero rewrites.",
+                    err=True,
+                )
+            try:
+                outcomes = run_perturbations(
+                    None,
+                    policy=policy,
+                    anchors=anchors,
+                    supervised_client=backend,  # type: ignore[arg-type]
+                    judge_client=backend,  # type: ignore[arg-type]
+                    generators=generators,
+                    supervised_model=settings.ollama_supervised_model,
+                    judge_model=settings.ollama_judge_model,
+                    replay=replay,
+                    on_outcome=_stream_outcome,
+                    on_generation=_stream_generation,
+                    replicates=replicates,
+                    synthesized_probe_id=sid,
+                )
+            except KeyError as exc:
+                typer.echo(f"unknown synthesized id: {exc}", err=True)
+                raise typer.Exit(code=4) from exc
+            except ValueError as exc:
+                typer.echo(f"invalid configuration: {exc}", err=True)
+                raise typer.Exit(code=5) from exc
+            except LLMError as exc:
+                typer.echo(f"LLM backend error on {label}: {exc}", err=True)
+                failures += 1
+                continue
+            _print_perturbation_summary(label, outcomes)
+    else:
+        for i, aid in enumerate(target_ids, start=1):
+            if all_anchors:
+                typer.echo(f"[{i}/{len(target_ids)}] anchor={aid}")
+            else:
+                typer.echo(f"anchor={aid}")
+            try:
+                outcomes = run_perturbations(
+                    aid,
+                    policy=policy,
+                    anchors=anchors,
+                    supervised_client=backend,  # type: ignore[arg-type]
+                    judge_client=backend,  # type: ignore[arg-type]
+                    generators=generators,
+                    supervised_model=settings.ollama_supervised_model,
+                    judge_model=settings.ollama_judge_model,
+                    replay=replay,
+                    on_outcome=_stream_outcome,
+                    on_generation=_stream_generation,
+                    replicates=replicates,
+                )
+            except KeyError as exc:
+                typer.echo(f"unknown anchor id: {exc}", err=True)
+                raise typer.Exit(code=4) from exc
+            except ValueError as exc:
+                typer.echo(f"invalid configuration: {exc}", err=True)
+                raise typer.Exit(code=5) from exc
+            except LLMError as exc:
+                typer.echo(f"LLM backend error on {aid}: {exc}", err=True)
+                failures += 1
+                continue
+            _print_perturbation_summary(aid, outcomes)
 
     if failures and failures == len(target_ids):
         raise typer.Exit(code=2)

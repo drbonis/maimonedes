@@ -23,8 +23,18 @@ EMPTY_STATE_MSG = (
 )
 
 
+SYNTH_PREFIX = "synth-"
+
+
+def _label_for(anchor_id: str) -> str:
+    """`[L] A1` for library anchors, `[S] synth-3` for synthesized probes."""
+    if anchor_id.startswith(SYNTH_PREFIX):
+        return f"[S] {anchor_id}"
+    return f"[L] {anchor_id}"
+
+
 @st.cache_data(ttl=10)
-def _cached_jacobians() -> dict[str, dict[str, object]]:
+def _cached_jacobians(include_synthesized: bool) -> dict[str, dict[str, object]]:
     """Return jacobians as plain dicts (cache_data needs picklable values)."""
     return {
         anchor_id: {
@@ -39,13 +49,15 @@ def _cached_jacobians() -> dict[str, dict[str, object]]:
                 for r in jac.rows
             ],
         }
-        for anchor_id, jac in all_jacobians().items()
+        for anchor_id, jac in all_jacobians(
+            include_synthesized=include_synthesized
+        ).items()
     }
 
 
 @st.cache_data(ttl=10)
-def _cached_aggregated() -> dict[str, object]:
-    table = aggregated_fragility()
+def _cached_aggregated(include_synthesized: bool) -> dict[str, object]:
+    table = aggregated_fragility(include_synthesized=include_synthesized)
     return {
         "perturbation_kinds": list(table.perturbation_kinds),
         "columns": list(table.columns),
@@ -127,30 +139,45 @@ def _render() -> None:
     st.set_page_config(page_title=PAGE_TITLE, layout="wide")
     st.title(PAGE_TITLE)
 
-    jacobians = _cached_jacobians()
-    aggregated = _cached_aggregated()
+    include_synthesized = st.checkbox(
+        "Include synthesized probes (`[S] synth-*`)",
+        value=True,
+        help=(
+            "When on, synthesized probes' Jacobians fold into the "
+            "aggregated table and appear in the per-parent dropdown "
+            "alongside curated library anchors. Off restores the "
+            "original Phase 2 library-only comparison."
+        ),
+    )
+
+    jacobians = _cached_jacobians(include_synthesized)
+    aggregated = _cached_aggregated(include_synthesized)
 
     if not jacobians and not aggregated["cells"]:  # type: ignore[index]
         st.info(EMPTY_STATE_MSG)
         return
 
-    st.subheader("Aggregated fragility (mean Δ across anchors)")
+    suffix = " + synthesized" if include_synthesized else ""
+    st.subheader(f"Aggregated fragility (mean Δ across parents{suffix})")
     if aggregated["cells"]:  # type: ignore[index]
         agg_df = _aggregated_dataframe(aggregated)
         st.dataframe(_heatmap(agg_df), use_container_width=True)
     else:
         st.write("(no aggregated data yet)")
 
-    st.subheader("Per-anchor Jacobian")
+    st.subheader("Per-parent Jacobian")
     if not jacobians:
-        st.write("(no anchor has both a baseline and perturbations yet)")
+        st.write("(no parent has both a baseline and perturbations yet)")
         return
 
-    anchor_id = st.selectbox(
-        "Anchor",
-        options=sorted(jacobians.keys()),
+    keys = sorted(jacobians.keys())
+    label_to_key = {_label_for(k): k for k in keys}
+    label = st.selectbox(
+        "Parent",
+        options=sorted(label_to_key.keys()),
         index=0,
     )
+    anchor_id = label_to_key[label]
     jac = jacobians[anchor_id]
     st.caption(
         f"Baseline aggregate for **{anchor_id}**: "
@@ -158,7 +185,7 @@ def _render() -> None:
     )
     df = _jacobian_dataframe(jac)
     if df.empty:
-        st.write("(no perturbations recorded for this anchor)")
+        st.write("(no perturbations recorded for this parent)")
         return
     st.dataframe(_heatmap(df), use_container_width=True)
 

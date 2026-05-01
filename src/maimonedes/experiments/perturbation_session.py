@@ -34,6 +34,34 @@ from maimonedes.storage.compliance import (
     record_score,
 )
 from maimonedes.storage.perturbations import record_perturbation
+from maimonedes.storage.synthesized_probes import (
+    get_synthesized_probe,
+    scores_for_synthesized_probe,
+)
+
+
+SYNTH_ANCHOR_PREFIX = "synth-"
+
+
+def synth_anchor_id(synthesized_probe_id: int) -> str:
+    """Namespaced anchor id used for perturbations of synthesized probes.
+
+    Carrying `synth-{id}` in `perturbation_probes.anchor_id` keeps the
+    existing per-anchor query path working for synthesized parents
+    (Phase 2 dashboard, fragility, contrastive pair) without forcing
+    every consumer to dual-mode on the FK column.
+    """
+    return f"{SYNTH_ANCHOR_PREFIX}{synthesized_probe_id}"
+
+
+def parse_synth_anchor_id(anchor_id: str) -> int | None:
+    """Extract the synthesized_probe_id from a namespaced anchor id, or None."""
+    if not anchor_id.startswith(SYNTH_ANCHOR_PREFIX):
+        return None
+    try:
+        return int(anchor_id[len(SYNTH_ANCHOR_PREFIX):])
+    except ValueError:
+        return None
 
 
 log = logging.getLogger(__name__)
@@ -90,8 +118,46 @@ def _new_run_id() -> str:
     return secrets.token_hex(8)
 
 
+def _build_synthesized_anchor(
+    synthesized_probe_id: int, policy: Policy
+) -> AnchorProbe:
+    """Materialise a synthesized probe as an `AnchorProbe`-shaped parent.
+
+    The perturbation generators only read `id`, `scenario`, and
+    `policy_id` off the parent. Wrapping the synthesized probe as an
+    `AnchorProbe` (with a synthetic `expected_baseline_compliance` of
+    0.5 — never read by the generators) lets the existing pipeline
+    work with no special-case branches.
+    """
+    synth = get_synthesized_probe(synthesized_probe_id)
+    if synth is None:
+        raise KeyError(f"synthesized_probe_id={synthesized_probe_id} not found")
+    if synth.policy_id != policy.id:
+        raise ValueError(
+            f"synthesized probe {synthesized_probe_id} policy "
+            f"{synth.policy_id!r} does not match loaded policy {policy.id!r}"
+        )
+    return AnchorProbe(
+        id=synth_anchor_id(synthesized_probe_id),
+        scenario=synth.scenario,
+        policy_id=synth.policy_id,
+        expected_baseline_compliance=0.5,
+    )
+
+
+def _baseline_for_synthesized(
+    synthesized_probe_id: int,
+) -> ComplianceScore | None:
+    """Most-recent anchor-role score for a synthesized probe, or None."""
+    scores = scores_for_synthesized_probe(synthesized_probe_id)
+    anchor_scores = [s for s in scores if s.probe_role == "anchor"]
+    if not anchor_scores:
+        return None
+    return max(anchor_scores, key=lambda s: (s.scored_at, s.llm_call_id or 0))
+
+
 def run_perturbations(
-    anchor_id: str,
+    anchor_id: str | None = None,
     *,
     policy: Policy,
     anchors: Iterable[AnchorProbe],
@@ -105,8 +171,22 @@ def run_perturbations(
     on_outcome: ProgressCallback | None = None,
     on_generation: GenerationCallback | None = None,
     replicates: int = 1,
+    synthesized_probe_id: int | None = None,
 ) -> list[PerturbationOutcome]:
-    """Generate, run, score, and persist perturbations for one anchor.
+    """Generate, run, score, and persist perturbations for one parent.
+
+    Two parent kinds are supported:
+
+    - `anchor_id` set, `synthesized_probe_id` is `None` — perturb the
+      curated anchor with the matching id from `anchors`. Default Phase 2
+      behaviour.
+    - `synthesized_probe_id` set, `anchor_id` is `None` — perturb the
+      synthesized probe with that id from `synthesized_probes`. The
+      probe's `scenario` text is loaded from the DB; persisted
+      `perturbation_probes` rows carry `synthesized_probe_id` set
+      and `anchor_id = f"synth-{id}"`.
+
+    Exactly one of the two must be set.
 
     `on_outcome` fires once per probe, immediately after that probe's
     score is persisted (or its failure is recorded). `on_generation`
@@ -115,26 +195,36 @@ def run_perturbations(
     scoring loop starts.
 
     When `replicates > 1`, the entire generate-and-score pipeline runs
-    N times for the anchor. Each replicate gets a fresh call into
+    N times for the parent. Each replicate gets a fresh call into
     every generator (so paraphrase produces different rewrites each
     replicate at its own temperature=0.7) and fresh supervised + judge
     calls. All probes from a single `run_perturbations` invocation
     share a single `run_id` stamped into their `generator_metadata`,
     plus a per-replicate `replicate_index`. The Jacobian aggregator
-    uses these to group replicates of the same `(anchor, transform_label)`
+    uses these to group replicates of the same `(parent, transform_label)`
     condition and report mean ± std.
     """
     if replicates < 1:
         raise ValueError(f"replicates must be >= 1, got {replicates}")
 
-    anchor = get_anchor_by_id(list(anchors), anchor_id)
-    if anchor.policy_id != policy.id:
+    if (anchor_id is None) == (synthesized_probe_id is None):
         raise ValueError(
-            f"anchor {anchor.id!r} declares policy {anchor.policy_id!r} "
-            f"but loaded policy is {policy.id!r}"
+            "run_perturbations: exactly one of `anchor_id` or "
+            "`synthesized_probe_id` must be set"
         )
 
-    baseline = latest_anchor_baseline(anchor.id)
+    if synthesized_probe_id is not None:
+        anchor = _build_synthesized_anchor(synthesized_probe_id, policy)
+        baseline = _baseline_for_synthesized(synthesized_probe_id)
+    else:
+        assert anchor_id is not None  # narrow for type checker
+        anchor = get_anchor_by_id(list(anchors), anchor_id)
+        if anchor.policy_id != policy.id:
+            raise ValueError(
+                f"anchor {anchor.id!r} declares policy {anchor.policy_id!r} "
+                f"but loaded policy is {policy.id!r}"
+            )
+        baseline = latest_anchor_baseline(anchor.id)
     baseline_aggregate = baseline.aggregate if baseline is not None else None
 
     supervised_rc = RecordingClient(
@@ -184,7 +274,8 @@ def run_perturbations(
                         **probe.generator_metadata,
                         "run_id": run_id,
                         "replicate_index": replicate_idx,
-                    }
+                    },
+                    "synthesized_probe_id": synthesized_probe_id,
                 }
             )
             outcome = _run_single(
@@ -284,5 +375,8 @@ __all__ = [
     "PerturbationProgress",
     "ProgressCallback",
     "SUPERVISED_BACKEND_NAME",
+    "SYNTH_ANCHOR_PREFIX",
+    "parse_synth_anchor_id",
     "run_perturbations",
+    "synth_anchor_id",
 ]

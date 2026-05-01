@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Integer, String, Text, select
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, select
 from sqlalchemy.orm import Mapped, mapped_column
 
 from maimonedes.core.perturbation import PerturbationKind, PerturbationProbe
@@ -28,6 +28,9 @@ class PerturbationProbeRow(Base):
     generator_metadata_json: Mapped[str] = mapped_column(
         Text, nullable=False, default="{}"
     )
+    synthesized_probe_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("synthesized_probes.id"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -48,6 +51,7 @@ def _row_to_probe(row: PerturbationProbeRow) -> PerturbationProbe:
         perturbation_kind=row.perturbation_kind,  # type: ignore[arg-type]
         transform_label=row.transform_label,
         generator_metadata=metadata,
+        synthesized_probe_id=row.synthesized_probe_id,
     )
 
 
@@ -62,6 +66,7 @@ def record_perturbation(probe: PerturbationProbe) -> int:
             scenario=probe.scenario,
             policy_id=probe.policy_id,
             generator_metadata_json=payload,
+            synthesized_probe_id=probe.synthesized_probe_id,
         )
         session.add(row)
         session.flush()

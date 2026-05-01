@@ -32,13 +32,28 @@ PerturbationKind = Literal[
 
 
 class PerturbationProbe(Probe):
-    """A probe derived from an anchor by one perturbation generator."""
+    """A probe derived from an anchor by one perturbation generator.
+
+    Parent provenance:
+
+    - `anchor_id` is always set. For curated v1 anchors (A1..A8) it
+      carries the literal anchor id. For synthesized parents
+      (`synthesized_probe_id` set) it carries `f"synth-{probe_id}"`
+      so the existing per-anchor query/Jacobian path keeps working.
+    - `synthesized_probe_id` is the explicit FK to `synthesized_probes`.
+      `None` for curated parents; set for parents from the
+      `synthesized_probes` table.
+
+    Soft invariant: exactly one of `synthesized_probe_id is None` /
+    `synthesized_probe_id is not None` describes the parent type.
+    """
 
     kind: Literal["perturbation"] = "perturbation"
     anchor_id: str = Field(min_length=1)
     perturbation_kind: PerturbationKind
     transform_label: str = Field(min_length=1)
     generator_metadata: dict[str, Any] = Field(default_factory=dict)
+    synthesized_probe_id: int | None = None
 
     @model_validator(mode="before")
     @classmethod
