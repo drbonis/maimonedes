@@ -270,6 +270,11 @@ def train_stage2_cmd(
         1.0, "--ridge-alpha", help="L2 regularization for Ridge heads."
     ),
     seed: int = typer.Option(0, "--seed", help="Split + Ridge RNG seed."),
+    head_kind: str = typer.Option(
+        "ridge",
+        "--head-kind",
+        help="Per-axis head architecture: 'ridge' (default) or 'mlp'.",
+    ),
     replay: bool = typer.Option(
         False,
         "--replay",
@@ -283,6 +288,13 @@ def train_stage2_cmd(
     from maimonedes.llm.recording_embed_client import RecordingEmbedClient
     from maimonedes.models.stage2 import train_stage2
     from maimonedes.storage.stage2_models import record_stage2_model
+
+    if head_kind not in {"ridge", "mlp"}:
+        typer.echo(
+            f"unknown --head-kind {head_kind!r}; expected 'ridge' or 'mlp'",
+            err=True,
+        )
+        raise typer.Exit(code=5)
 
     try:
         policy = load_policy(policy_path, rubric_path)
@@ -308,6 +320,7 @@ def train_stage2_cmd(
             eval_fraction=eval_fraction,
             ridge_alpha=ridge_alpha,
             seed=seed,
+            head_kind=head_kind,  # type: ignore[arg-type]
         )
     except ValueError as exc:
         typer.echo(f"training failed: {exc}", err=True)
@@ -331,10 +344,12 @@ def train_stage2_cmd(
         mae_per_axis=mae,
         spearman_per_axis=rho,
         agreement_status=model.agreement_status,
+        head_kind=model.head_kind,
     )
 
     typer.echo(
         f"stage2_model_id={model_id} path={saved} "
+        f"head_kind={model.head_kind} "
         f"n_train={model.n_train} n_eval={model.n_eval} "
         f"agreement_status={model.agreement_status}"
     )

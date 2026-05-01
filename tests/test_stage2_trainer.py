@@ -379,6 +379,233 @@ def test_train_stage2_cli_exits_5_on_short_dataset(
     assert "training failed" in result.output
 
 
+# ---- MLP heads (#45) -------------------------------------------------------
+
+
+def test_train_stage2_with_mlp_head_returns_pipeline(
+    db: str, policy: Policy
+) -> None:
+    """`head_kind='mlp'` produces Pipeline(scaler, MLPRegressor) per axis."""
+    from sklearn.neural_network import MLPRegressor
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    _seed_training_data(policy, n_per_anchor=30, anchors=("A1", "A2"))
+    fake = FakeEmbedClient(default_dim=16)
+    model = train_stage2(
+        policy=policy,
+        embed_client=fake,
+        embedding_model="fake-embed",
+        min_samples=50,
+        seed=0,
+        head_kind="mlp",
+    )
+    assert model.head_kind == "mlp"
+    assert set(model.heads) == {s.id for s in policy.rubric.sub_conditions}
+    for sub_id, head in model.heads.items():
+        assert isinstance(head, Pipeline), sub_id
+        assert isinstance(head.named_steps["scaler"], StandardScaler)
+        assert isinstance(head.named_steps["head"], MLPRegressor)
+
+
+def test_train_stage2_default_ridge_uses_pipeline(
+    db: str, policy: Policy
+) -> None:
+    """Default (`ridge`) also wraps in `Pipeline(StandardScaler, Ridge)`."""
+    from sklearn.linear_model import Ridge
+    from sklearn.pipeline import Pipeline
+
+    _seed_training_data(policy, n_per_anchor=30, anchors=("A1", "A2"))
+    fake = FakeEmbedClient(default_dim=16)
+    model = train_stage2(
+        policy=policy,
+        embed_client=fake,
+        embedding_model="fake-embed",
+        min_samples=50,
+        seed=0,
+    )
+    assert model.head_kind == "ridge"
+    for sub_id, head in model.heads.items():
+        assert isinstance(head, Pipeline), sub_id
+        assert isinstance(head.named_steps["head"], Ridge)
+
+
+def test_train_stage2_mlp_save_load_round_trip(
+    db: str, policy: Policy, tmp_path: Path
+) -> None:
+    """MLP-headed model survives pickle round-trip and prediction matches."""
+    _seed_training_data(policy, n_per_anchor=30, anchors=("A1", "A2"))
+    fake = FakeEmbedClient(default_dim=16)
+    model = train_stage2(
+        policy=policy,
+        embed_client=fake,
+        embedding_model="fake-embed",
+        min_samples=50,
+        seed=42,
+        head_kind="mlp",
+    )
+    path = model.save(tmp_path / "stage2_mlp.pkl")
+    loaded = Stage2Model.load(path)
+    assert loaded.head_kind == "mlp"
+    embedding = [0.3] * 16
+    assert loaded.predict_per_axis(embedding) == pytest.approx(
+        model.predict_per_axis(embedding)
+    )
+
+
+def test_train_stage2_rejects_unknown_head_kind(
+    db: str, policy: Policy
+) -> None:
+    _seed_training_data(policy, n_per_anchor=30, anchors=("A1", "A2"))
+    fake = FakeEmbedClient(default_dim=16)
+    with pytest.raises(ValueError, match="unknown head_kind"):
+        train_stage2(
+            policy=policy,
+            embed_client=fake,
+            embedding_model="fake-embed",
+            min_samples=50,
+            head_kind="forest",  # type: ignore[arg-type]
+        )
+
+
+def test_record_stage2_persists_head_kind(db: str) -> None:
+    model_id = record_stage2_model(
+        path="models/x.pkl",
+        policy_id="scope_of_practice",
+        n_samples=60,
+        embedding_model="bio_clinicalbert",
+        mae_per_axis={"x": 0.1},
+        spearman_per_axis={"x": 0.7},
+        agreement_status="green",
+        head_kind="mlp",
+    )
+    rows = list_stage2_models(policy_id="scope_of_practice")
+    row = next(r for r in rows if r.id == model_id)
+    assert row.head_kind == "mlp"
+
+
+def test_record_stage2_defaults_head_kind_to_ridge(db: str) -> None:
+    """Pre-#45 callers that don't pass `head_kind` get 'ridge' on the row."""
+    model_id = record_stage2_model(
+        path="models/y.pkl",
+        policy_id="scope_of_practice",
+        n_samples=60,
+        embedding_model="bio_clinicalbert",
+        mae_per_axis={"x": 0.1},
+        spearman_per_axis={"x": 0.7},
+        agreement_status="green",
+    )
+    rows = list_stage2_models(policy_id="scope_of_practice")
+    row = next(r for r in rows if r.id == model_id)
+    assert row.head_kind == "ridge"
+
+
+def test_train_stage2_cli_with_head_kind_mlp(
+    db: str, policy: Policy, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_training_data(policy, n_per_anchor=30, anchors=("A1", "A2"))
+    fake = FakeEmbedClient(default_dim=16)
+    monkeypatch.setattr(cli, "_embed_factory", lambda settings: fake)
+
+    output = tmp_path / "stage2_mlp_cli.pkl"
+    result = runner.invoke(
+        app,
+        [
+            "train-stage2",
+            "--policy",
+            str(POLICY_PATH),
+            "--rubric",
+            str(RUBRIC_PATH),
+            "--output",
+            str(output),
+            "--min-samples",
+            "50",
+            "--head-kind",
+            "mlp",
+        ],
+    )
+    assert result.exit_code in (0, 6), result.output
+    assert "head_kind=mlp" in result.output
+    rows = list_stage2_models(policy_id=policy.id)
+    assert any(r.head_kind == "mlp" for r in rows)
+
+
+def test_train_stage2_cli_rejects_unknown_head_kind(
+    db: str, policy: Policy, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeEmbedClient(default_dim=8)
+    monkeypatch.setattr(cli, "_embed_factory", lambda settings: fake)
+    result = runner.invoke(
+        app,
+        [
+            "train-stage2",
+            "--policy",
+            str(POLICY_PATH),
+            "--rubric",
+            str(RUBRIC_PATH),
+            "--output",
+            str(tmp_path / "_.pkl"),
+            "--head-kind",
+            "forest",
+        ],
+    )
+    assert result.exit_code == 5
+    assert "unknown --head-kind" in result.output
+
+
+def test_stage2_scorer_works_with_mlp_pipeline(
+    db: str, policy: Policy
+) -> None:
+    """Stage2Scorer.score() runs through Pipeline-wrapped heads."""
+    from maimonedes.core.probe import AnchorProbe
+    from maimonedes.scorer.stage2 import Stage2Scorer
+
+    _seed_training_data(policy, n_per_anchor=30, anchors=("A1", "A2"))
+    fake = FakeEmbedClient(default_dim=16)
+    model = train_stage2(
+        policy=policy,
+        embed_client=fake,
+        embedding_model="fake-embed",
+        min_samples=50,
+        seed=0,
+        head_kind="mlp",
+    )
+    scorer = Stage2Scorer(
+        model=model,
+        embed_client=fake,
+        policy=policy,
+    )
+    anchor = AnchorProbe(
+        id="A1",
+        scenario="dummy text for embedding",
+        policy_id=policy.id,
+        expected_baseline_compliance=0.5,
+    )
+    score = scorer.score(anchor, "supervised output text")
+    assert 0.0 <= score.aggregate <= 1.0
+    assert set(score.per_sub_condition) == {
+        s.id for s in policy.rubric.sub_conditions
+    }
+
+
+def test_alembic_round_trip_with_head_kind_column(db: str) -> None:
+    """Migration 0013 round-trips clean."""
+    cfg = _alembic_cfg(db)
+    insp = inspect(get_engine())
+    cols_before = {c["name"] for c in insp.get_columns("stage2_models")}
+    assert "head_kind" in cols_before
+
+    command.downgrade(cfg, "0012_synthesized_probes")
+    insp = inspect(get_engine())
+    cols_after = {c["name"] for c in insp.get_columns("stage2_models")}
+    assert "head_kind" not in cols_after
+
+    command.upgrade(cfg, "head")
+    insp = inspect(get_engine())
+    cols_restored = {c["name"] for c in insp.get_columns("stage2_models")}
+    assert "head_kind" in cols_restored
+
+
 @pytest.mark.integration
 def test_train_stage2_cli_against_real_embed_service(
     db: str, policy: Policy, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

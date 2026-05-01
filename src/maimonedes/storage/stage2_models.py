@@ -29,6 +29,9 @@ class Stage2ModelRow(Base):
     mae_per_axis_json: Mapped[str] = mapped_column(Text, nullable=False)
     spearman_per_axis_json: Mapped[str] = mapped_column(Text, nullable=False)
     agreement_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    head_kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="ridge", server_default="ridge"
+    )
 
 
 def record_stage2_model(
@@ -40,6 +43,7 @@ def record_stage2_model(
     mae_per_axis: dict[str, float],
     spearman_per_axis: dict[str, float],
     agreement_status: str,
+    head_kind: str = "ridge",
 ) -> int:
     with get_session() as session:
         row = Stage2ModelRow(
@@ -50,6 +54,7 @@ def record_stage2_model(
             mae_per_axis_json=json.dumps(mae_per_axis, sort_keys=True),
             spearman_per_axis_json=json.dumps(spearman_per_axis, sort_keys=True),
             agreement_status=agreement_status,
+            head_kind=head_kind,
         )
         session.add(row)
         session.flush()

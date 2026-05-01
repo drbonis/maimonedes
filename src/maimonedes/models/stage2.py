@@ -13,16 +13,21 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 from scipy import stats
 from sklearn.linear_model import Ridge
-from sqlalchemy import select
+from sklearn.neural_network import MLPRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from maimonedes.core.compliance import ComplianceScore
 from maimonedes.core.policy import Policy
 from maimonedes.llm.embed_client import EmbedClient
 from maimonedes.storage.llm_calls import pair_supervised_with_scores
+
+HeadKind = Literal["ridge", "mlp"]
 
 
 log = logging.getLogger(__name__)
@@ -48,7 +53,13 @@ class AxisMetrics:
 
 @dataclass
 class Stage2Model:
-    """Trained per-axis Stage-2 classifier — picklable artefact."""
+    """Trained per-axis Stage-2 classifier — picklable artefact.
+
+    `heads` carries the per-axis predictor, which is either a bare
+    `sklearn.linear_model.Ridge` (legacy v1 artefacts saved before
+    #45) or a `Pipeline(StandardScaler, head)` (post-#45 trainer).
+    Both expose `.predict(X) -> ndarray`, so callers stay agnostic.
+    """
 
     policy_id: str
     trained_at: datetime
@@ -57,9 +68,10 @@ class Stage2Model:
     n_eval: int
     embedding_model: str
     feature_dim: int
-    heads: dict[str, Ridge]
+    heads: dict[str, Pipeline | Ridge]
     agreement_metrics: list[AxisMetrics]
     agreement_status: str  # "green" | "amber" | "red"
+    head_kind: HeadKind = "ridge"
 
     def predict_per_axis(self, embedding: Sequence[float]) -> dict[str, float]:
         x = np.asarray(embedding, dtype=float).reshape(1, -1)
@@ -182,6 +194,32 @@ def _grade_agreement(metrics: list[AxisMetrics]) -> str:
     return "amber"
 
 
+def _build_head(
+    head_kind: HeadKind, *, ridge_alpha: float, seed: int
+) -> Pipeline:
+    """Per-axis pipeline: StandardScaler → Ridge or MLPRegressor.
+
+    Wrapping every head in a `Pipeline` keeps `Stage2Model.predict_per_axis`
+    agnostic to the head family. The scaler is fit on the training
+    embeddings; at predict time it normalises new embeddings before
+    they hit the regressor.
+    """
+    if head_kind == "ridge":
+        regressor = Ridge(alpha=ridge_alpha, random_state=seed)
+    elif head_kind == "mlp":
+        regressor = MLPRegressor(
+            hidden_layer_sizes=(256,),
+            activation="relu",
+            solver="adam",
+            alpha=1e-4,
+            max_iter=500,
+            random_state=seed,
+        )
+    else:
+        raise ValueError(f"unknown head_kind {head_kind!r}; expected 'ridge' or 'mlp'")
+    return Pipeline(steps=[("scaler", StandardScaler()), ("head", regressor)])
+
+
 def train_stage2(
     *,
     policy: Policy,
@@ -191,8 +229,18 @@ def train_stage2(
     eval_fraction: float = 0.2,
     ridge_alpha: float = 1.0,
     seed: int = 0,
+    head_kind: HeadKind = "ridge",
 ) -> Stage2Model:
-    """Pull training data, embed, fit per-axis ridge heads, return artefact.
+    """Pull training data, embed, fit per-axis heads, return artefact.
+
+    Each axis gets its own `Pipeline(StandardScaler, head)`. The head
+    family is chosen by `head_kind`:
+    - `"ridge"` (default) — `sklearn.linear_model.Ridge(alpha=ridge_alpha)`.
+      Same behaviour as pre-#45 trainer.
+    - `"mlp"` — `sklearn.neural_network.MLPRegressor` with a single
+      256-unit ReLU hidden layer. For axes whose Ridge ρ is weak but
+      MAE is small (linear underfit), the MLP often recovers ranking
+      power. Cost: ~1–2 minutes total train time across axes.
 
     Raises `ValueError` if fewer than `min_samples` (text, score) pairs are
     available — agreement metrics on tiny datasets are meaningless.
@@ -229,20 +277,20 @@ def train_stage2(
     X_eval = np.asarray(eval_embeddings, dtype=float) if eval_embeddings else None
 
     sub_conditions = policy.rubric.sub_conditions
-    heads: dict[str, Ridge] = {}
+    heads: dict[str, Pipeline | Ridge] = {}
     metrics: list[AxisMetrics] = []
     for sub in sub_conditions:
         y_train = np.asarray(
             [ex.score.per_sub_condition.get(sub.id, 0.0) for ex in train],
             dtype=float,
         )
-        head = Ridge(alpha=ridge_alpha, random_state=seed)
-        head.fit(X_train, y_train)
-        heads[sub.id] = head
+        pipeline = _build_head(head_kind, ridge_alpha=ridge_alpha, seed=seed)
+        pipeline.fit(X_train, y_train)
+        heads[sub.id] = pipeline
 
         if X_eval is not None and X_eval.shape[0] > 0:
             y_eval = [ex.score.per_sub_condition.get(sub.id, 0.0) for ex in evalset]
-            preds = np.clip(head.predict(X_eval), 0.0, 1.0).tolist()
+            preds = np.clip(pipeline.predict(X_eval), 0.0, 1.0).tolist()
             mae = float(np.mean(np.abs(np.asarray(y_eval) - np.asarray(preds))))
             rho = _spearman_rho(list(y_eval), preds)
         else:
@@ -263,11 +311,13 @@ def train_stage2(
         heads=heads,
         agreement_metrics=metrics,
         agreement_status=status,
+        head_kind=head_kind,
     )
 
 
 __all__ = [
     "AxisMetrics",
+    "HeadKind",
     "Stage2Model",
     "TrainingExample",
     "train_stage2",
