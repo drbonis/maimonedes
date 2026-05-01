@@ -9,7 +9,9 @@ from maimonedes.storage import (  # noqa: F401
     compliance,
     drift,
     llm_calls,
+    metric_fits,
     models,
     perturbations,
     recovery,
+    structural_signals,
 )
