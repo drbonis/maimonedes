@@ -94,7 +94,7 @@ def test_migration_creates_audit_runs_table(db: str) -> None:
 
 def test_alembic_round_trip_clean(db: str) -> None:
     cfg = _alembic_cfg(db)
-    command.downgrade(cfg, "0009_stage2_models")
+    command.downgrade(cfg, "0011_stage2_models")
     insp = inspect(get_engine())
     assert "audit_runs" not in insp.get_table_names()
     command.upgrade(cfg, "head")

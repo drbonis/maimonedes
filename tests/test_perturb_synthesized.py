@@ -167,7 +167,7 @@ def test_migration_round_trip_clean(db: str) -> None:
         c["name"] for c in insp.get_columns("perturbation_probes")
     }
 
-    command.downgrade(cfg, "0013_stage2_head_kind")
+    command.downgrade(cfg, "0015_stage2_head_kind")
     insp = inspect(get_engine())
     assert "synthesized_probe_id" not in {
         c["name"] for c in insp.get_columns("perturbation_probes")

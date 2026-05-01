@@ -84,7 +84,7 @@ def test_migration_creates_stage2_models_table(db: str) -> None:
 
 def test_alembic_round_trip_clean(db: str) -> None:
     cfg = _alembic_cfg(db)
-    command.downgrade(cfg, "0008_embed_calls")
+    command.downgrade(cfg, "0010_embed_calls")
     insp = inspect(get_engine())
     assert "stage2_models" not in insp.get_table_names()
     command.upgrade(cfg, "head")
@@ -595,7 +595,7 @@ def test_alembic_round_trip_with_head_kind_column(db: str) -> None:
     cols_before = {c["name"] for c in insp.get_columns("stage2_models")}
     assert "head_kind" in cols_before
 
-    command.downgrade(cfg, "0012_synthesized_probes")
+    command.downgrade(cfg, "0014_synthesized_probes")
     insp = inspect(get_engine())
     cols_after = {c["name"] for c in insp.get_columns("stage2_models")}
     assert "head_kind" not in cols_after

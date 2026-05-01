@@ -82,7 +82,7 @@ def test_migration_creates_gp_fits_table(db: str) -> None:
 
 def test_alembic_round_trip_clean(db: str) -> None:
     cfg = _alembic_cfg(db)
-    command.downgrade(cfg, "0010_audit_runs")
+    command.downgrade(cfg, "0012_audit_runs")
     insp = inspect(get_engine())
     assert "gp_fits" not in insp.get_table_names()
     command.upgrade(cfg, "head")

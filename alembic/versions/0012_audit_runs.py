@@ -1,7 +1,7 @@
 """audit_runs table
 
-Revision ID: 0010_audit_runs
-Revises: 0009_stage2_models
+Revision ID: 0012_audit_runs
+Revises: 0011_stage2_models
 Create Date: 2026-04-30 00:00:02
 
 Phase 5 Stage-2 audit log. Each row records one re-routing of
@@ -17,8 +17,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0010_audit_runs"
-down_revision: str | None = "0009_stage2_models"
+revision: str = "0012_audit_runs"
+down_revision: str | None = "0011_stage2_models"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

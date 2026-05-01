@@ -73,7 +73,7 @@ def test_migration_extends_compliance_scores_with_synthesized_probe_id(
 
 def test_alembic_round_trip_clean(db: str) -> None:
     cfg = _alembic_cfg(db)
-    command.downgrade(cfg, "0011_gp_fits")
+    command.downgrade(cfg, "0013_gp_fits")
     insp = inspect(get_engine())
     assert "synthesized_probes" not in insp.get_table_names()
     cols = {c["name"] for c in insp.get_columns("compliance_scores")}

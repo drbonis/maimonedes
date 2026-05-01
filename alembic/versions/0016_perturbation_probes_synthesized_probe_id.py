@@ -1,7 +1,7 @@
 """perturbation_probes.synthesized_probe_id
 
-Revision ID: 0014_perturbation_probes_synthesized_probe_id
-Revises: 0013_stage2_head_kind
+Revision ID: 0016_perturbation_probes_synthesized_probe_id
+Revises: 0015_stage2_head_kind
 Create Date: 2026-05-01 00:00:01
 
 Phase 5 #53 — `maimonedes perturb --synthesized <id>` extends the
@@ -22,8 +22,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0014_perturbation_probes_synthesized_probe_id"
-down_revision: str | None = "0013_stage2_head_kind"
+revision: str = "0016_perturbation_probes_synthesized_probe_id"
+down_revision: str | None = "0015_stage2_head_kind"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

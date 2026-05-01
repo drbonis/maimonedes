@@ -1,7 +1,7 @@
 """stage2_models.head_kind
 
-Revision ID: 0013_stage2_head_kind
-Revises: 0012_synthesized_probes
+Revision ID: 0015_stage2_head_kind
+Revises: 0014_synthesized_probes
 Create Date: 2026-04-30 00:00:05
 
 Phase 5 #45 — Stage-2 optionally fits MLP heads (sklearn
@@ -20,8 +20,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0013_stage2_head_kind"
-down_revision: str | None = "0012_synthesized_probes"
+revision: str = "0015_stage2_head_kind"
+down_revision: str | None = "0014_synthesized_probes"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

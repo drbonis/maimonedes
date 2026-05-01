@@ -12,9 +12,11 @@ from maimonedes.storage import (  # noqa: F401
     embed_calls,
     gp_fits,
     llm_calls,
+    metric_fits,
     models,
     perturbations,
     recovery,
     stage2_models,
+    structural_signals,
     synthesized_probes,
 )

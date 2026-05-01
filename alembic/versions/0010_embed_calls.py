@@ -1,7 +1,7 @@
 """embed_calls table
 
-Revision ID: 0008_embed_calls
-Revises: 0007_recovery_runs
+Revision ID: 0010_embed_calls
+Revises: 0009_structural_signals
 Create Date: 2026-04-30 00:00:00
 
 Phase 5 introduces the Bio_ClinicalBERT embedding service as a first-
@@ -18,8 +18,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0008_embed_calls"
-down_revision: str | None = "0007_recovery_runs"
+revision: str = "0010_embed_calls"
+down_revision: str | None = "0009_structural_signals"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

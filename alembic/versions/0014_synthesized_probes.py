@@ -1,7 +1,7 @@
 """synthesized_probes table + compliance_scores.synthesized_probe_id
 
-Revision ID: 0012_synthesized_probes
-Revises: 0011_gp_fits
+Revision ID: 0014_synthesized_probes
+Revises: 0013_gp_fits
 Create Date: 2026-04-30 00:00:04
 
 Phase 5 probe synthesis (#42 / #43) records every LLM-generated
@@ -19,8 +19,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0012_synthesized_probes"
-down_revision: str | None = "0011_gp_fits"
+revision: str = "0014_synthesized_probes"
+down_revision: str | None = "0013_gp_fits"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
