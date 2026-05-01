@@ -60,6 +60,18 @@ from maimonedes.monitor.fragility import (
     aggregated_fragility,
     all_jacobians,
 )
+from maimonedes.monitor.metric import (
+    RiemannianMetric,
+    euclidean_distance,
+    fit_metric,
+    riemannian_distance,
+)
+from maimonedes.storage.metric_fits import (
+    get_metric_fit,
+    latest_metric_fit_for_policy,
+    list_metric_fits,
+    record_metric_fit,
+)
 from maimonedes.monitor.recovery_report import (
     NoRecoveryDataError,
     OrphanRecoveryRunError,
@@ -687,8 +699,13 @@ def induce_drift_cmd(
 
 
 def _format_report_table(report: DriftReport) -> list[str]:
-    """Plain-text table — grep-friendly, no rich. Returns lines."""
-    headers = (
+    """Plain-text table — grep-friendly, no rich. Returns lines.
+
+    When `report.has_riemannian_columns` is True, two extra columns
+    are appended: `eucl_d` and `riem_d` (worst-score displacement
+    from baseline, flat L2 vs learned metric).
+    """
+    base_headers = [
         "anchor",
         "n_sess",
         "mean_base",
@@ -697,7 +714,12 @@ def _format_report_table(report: DriftReport) -> list[str]:
         "cusum",
         "ewma",
         "lead",
-    )
+    ]
+    has_riem = report.has_riemannian_columns
+    if has_riem:
+        headers = (*base_headers, "eucl_d", "riem_d")
+    else:
+        headers = tuple(base_headers)
     rows: list[tuple[str, ...]] = []
     for r in report.rows:
         if r.detector_skipped:
@@ -732,18 +754,29 @@ def _format_report_table(report: DriftReport) -> list[str]:
                 lead = "+inf"
             else:
                 lead = f"{lead_v:+.0f}"
-        rows.append(
-            (
-                r.anchor_id,
-                str(r.n_sessions),
-                mean_base,
-                min_agg,
-                first_viol,
-                cusum,
-                ewma,
-                lead,
-            )
+        row: tuple[str, ...] = (
+            r.anchor_id,
+            str(r.n_sessions),
+            mean_base,
+            min_agg,
+            first_viol,
+            cusum,
+            ewma,
+            lead,
         )
+        if has_riem:
+            eucl_d = (
+                f"{r.euclidean_displacement:.3f}"
+                if r.euclidean_displacement is not None
+                else "-"
+            )
+            riem_d = (
+                f"{r.riemannian_displacement:.3f}"
+                if r.riemannian_displacement is not None
+                else "-"
+            )
+            row = (*row, eucl_d, riem_d)
+        rows.append(row)
     widths = [
         max(len(headers[i]), *(len(row[i]) for row in rows)) if rows else len(headers[i])
         for i in range(len(headers))
@@ -775,6 +808,12 @@ def drift_report_cmd(
     L: float = typer.Option(
         3.0, "--L", help="EWMA control-limit width in baseline σ."
     ),
+    metric_id: int | None = typer.Option(
+        None,
+        "--metric",
+        help="metric_fit id from `fit-metric`; when set, the report adds "
+        "Euclidean and Riemannian displacement columns side by side.",
+    ),
 ) -> None:
     """Print detection-latency summary for a drift run."""
     run = get_drift_run(run_id)
@@ -790,6 +829,14 @@ def drift_report_cmd(
             err=True,
         )
 
+    metric_obj: RiemannianMetric | None = None
+    if metric_id is not None:
+        fit = get_metric_fit(metric_id)
+        if fit is None:
+            typer.echo(f"unknown metric_fit_id: {metric_id}", err=True)
+            raise typer.Exit(code=4)
+        metric_obj = RiemannianMetric.load(Path(str(fit["path"])))
+
     try:
         report = build_report(
             run_id,
@@ -797,6 +844,8 @@ def drift_report_cmd(
             k=k,
             lambda_=lambda_,
             L=L,
+            metric=metric_obj,
+            metric_id=metric_id,
         )
     except NoBaselineDataError as exc:
         typer.echo(f"insufficient baseline data: {exc}", err=True)
@@ -1176,6 +1225,168 @@ def fragility_report_cmd(
         f"summary: anchors={len(jacobians)} kinds={len(table.perturbation_kinds)} "
         f"cells={len(table.cells)}"
     )
+
+
+DEFAULT_METRICS_DIR = Path("models")
+
+
+@app.command("fit-metric")
+def fit_metric_cmd(
+    policy_path: Path = typer.Option(DEFAULT_POLICY_PATH, "--policy"),
+    rubric_path: Path = typer.Option(DEFAULT_RUBRIC_PATH, "--rubric"),
+    hidden: int = typer.Option(
+        32, "--hidden", help="MLP hidden width (per layer)."
+    ),
+    depth: int = typer.Option(
+        2, "--depth", help="Number of hidden ReLU layers."
+    ),
+    epochs: int = typer.Option(
+        200, "--epochs", help="Training epochs (full passes over the anchor pairs)."
+    ),
+    l2: float = typer.Option(
+        1e-3, "--l2", help="L2 regularisation coefficient on weights."
+    ),
+    lr: float = typer.Option(
+        1e-2, "--lr", help="Adam learning rate."
+    ),
+    seed: int = typer.Option(
+        0, "--seed", help="RNG seed for MLP init + train/val split."
+    ),
+    output_dir: Path = typer.Option(
+        DEFAULT_METRICS_DIR,
+        "--output-dir",
+        help="Directory under which the trained metric `.npz` is written.",
+    ),
+) -> None:
+    """Fit a Riemannian metric on the anchor Jacobians and persist it."""
+    try:
+        policy = load_policy(policy_path, rubric_path)
+    except FileNotFoundError as exc:
+        typer.echo(f"config file not found: {exc}", err=True)
+        raise typer.Exit(code=5) from exc
+
+    try:
+        metric = fit_metric(
+            policy=policy,
+            hidden=hidden,
+            depth=depth,
+            epochs=epochs,
+            l2=l2,
+            lr=lr,
+            seed=seed,
+        )
+    except ValueError as exc:
+        typer.echo(f"fit failed: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    from datetime import datetime, timezone
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / f"metric_{policy.id}_{timestamp}.npz"
+    metric.save(out_path)
+
+    fit_id = record_metric_fit(
+        policy_id=policy.id,
+        path=str(out_path),
+        n_anchors=metric.n_anchors,
+        n_jacobians=metric.n_jacobians,
+        val_loss=metric.eval_metrics.get("val_loss"),
+        train_loss=metric.eval_metrics.get("train_loss"),
+        hyperparams={
+            "hidden": hidden,
+            "depth": depth,
+            "epochs": epochs,
+            "l2": l2,
+            "lr": lr,
+            "seed": seed,
+        },
+    )
+    typer.echo(
+        f"metric_fit_id={fit_id} policy={policy.id} "
+        f"n_anchors={metric.n_anchors} n_jacobians={metric.n_jacobians}"
+    )
+    typer.echo(
+        f"  train_loss={metric.eval_metrics.get('train_loss', float('nan')):.5f} "
+        f"val_loss={metric.eval_metrics.get('val_loss', float('nan')):.5f}"
+    )
+    typer.echo(f"  path={out_path}")
+
+
+@app.command("metric-distance")
+def metric_distance_cmd(
+    c0: str = typer.Argument(
+        ..., help="First compliance point — comma-separated floats, e.g. '0.89,0.85'."
+    ),
+    c1: str = typer.Argument(
+        ..., help="Second compliance point — comma-separated floats."
+    ),
+    metric_id: int | None = typer.Option(
+        None,
+        "--metric-id",
+        help="metric_fit_id from `fit-metric`. Defaults to the most recent "
+        "fit for the policy passed via --policy.",
+    ),
+    policy_path: Path = typer.Option(DEFAULT_POLICY_PATH, "--policy"),
+    rubric_path: Path = typer.Option(DEFAULT_RUBRIC_PATH, "--rubric"),
+    n_segments: int = typer.Option(
+        16,
+        "--segments",
+        help="Number of integration segments along the straight-line path.",
+    ),
+) -> None:
+    """Compare Euclidean and Riemannian distance for two compliance points."""
+    try:
+        c0_arr = [float(x.strip()) for x in c0.split(",") if x.strip()]
+        c1_arr = [float(x.strip()) for x in c1.split(",") if x.strip()]
+    except ValueError as exc:
+        raise typer.BadParameter(f"could not parse c0/c1 as floats: {exc}") from exc
+
+    if metric_id is None:
+        try:
+            policy = load_policy(policy_path, rubric_path)
+        except FileNotFoundError as exc:
+            typer.echo(f"config file not found: {exc}", err=True)
+            raise typer.Exit(code=5) from exc
+        latest = latest_metric_fit_for_policy(policy.id)
+        if latest is None:
+            typer.echo(
+                f"no metric_fit found for policy={policy.id}; "
+                f"run `maimonedes fit-metric` first",
+                err=True,
+            )
+            raise typer.Exit(code=4)
+        metric_id_used = int(latest["id"])  # type: ignore[arg-type]
+        path = str(latest["path"])
+    else:
+        fit = get_metric_fit(metric_id)
+        if fit is None:
+            typer.echo(f"unknown metric_fit_id: {metric_id}", err=True)
+            raise typer.Exit(code=4)
+        metric_id_used = metric_id
+        path = str(fit["path"])
+
+    metric = RiemannianMetric.load(Path(path))
+    if len(c0_arr) != metric.k or len(c1_arr) != metric.k:
+        typer.echo(
+            f"compliance vectors must have k={metric.k} components; "
+            f"got len(c0)={len(c0_arr)}, len(c1)={len(c1_arr)}",
+            err=True,
+        )
+        raise typer.Exit(code=5)
+
+    import numpy as np
+    c0_np = np.asarray(c0_arr, dtype=np.float64)
+    c1_np = np.asarray(c1_arr, dtype=np.float64)
+    d_eucl = euclidean_distance(c0_np, c1_np)
+    d_riem = riemannian_distance(metric, c0_np, c1_np, n_segments=n_segments)
+    ratio = d_riem / d_eucl if d_eucl > 1e-12 else float("inf")
+
+    typer.echo(f"metric_fit_id={metric_id_used} path={path}")
+    typer.echo(f"c0={c0_arr}")
+    typer.echo(f"c1={c1_arr}")
+    typer.echo(f"euclidean_distance = {d_eucl:.6f}")
+    typer.echo(f"riemannian_distance = {d_riem:.6f}")
+    typer.echo(f"ratio (riem/eucl) = {ratio:.3f}")
 
 
 def main(argv: list[str] | None = None) -> None:
