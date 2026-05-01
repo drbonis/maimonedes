@@ -136,15 +136,17 @@ def test_fragility_page_renders_aggregated_and_per_anchor_with_data(
     assert not at.exception, [str(e) for e in at.exception]
     assert at.title[0].value == "Fragility — Phase 2"
 
-    # Two `st.subheader` blocks rendered (aggregated + per-anchor).
+    # Two `st.subheader` blocks rendered (aggregated + per-parent).
     subheader_values = [el.value for el in at.subheader]
     assert any("Aggregated fragility" in v for v in subheader_values)
-    assert any("Per-anchor Jacobian" in v for v in subheader_values)
+    assert any("Per-parent Jacobian" in v for v in subheader_values)
 
-    # The anchor selector should expose both anchors with baselines.
+    # The parent selector exposes both anchors with baselines, with
+    # the [L] / [S] prefix added by the post-#53 dashboard.
     assert len(at.selectbox) >= 1
     options = list(at.selectbox[0].options)
-    assert {"A1", "A2"}.issubset(set(options))
+    assert "[L] A1" in options
+    assert "[L] A2" in options
 
     # At least two dataframes were rendered (aggregated + per-anchor).
     assert len(at.dataframe) >= 2

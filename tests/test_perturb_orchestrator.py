@@ -547,7 +547,7 @@ def test_cli_perturb_streams_per_probe_progress(
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "running perturbations on 1 anchor(s)" in result.output
+    assert "running perturbations on 1 parent(s)" in result.output
     assert "generating AuthorityGenerator" in result.output
     # 4 authority probes → counters 01..04 of 04 (zero-padded)
     assert "[01/04] authority:senior_cardiologist" in result.output
