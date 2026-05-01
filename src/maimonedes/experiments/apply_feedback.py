@@ -355,7 +355,12 @@ def _evaluate_with_feedback(
         model=supervised_model,
         temperature=supervised_temperature,
     )
-    score = judge.score(policy, anchor, supervised_resp.content)
+    score = judge.score(
+        policy,
+        anchor,
+        supervised_resp.content,
+        llm_call_id=supervised_resp.llm_call_id,
+    )
     update: dict[str, object] = {"recovery_run_id": recovery_run_id}
     if probe_role == "perturbation":
         update["probe_role"] = "perturbation"

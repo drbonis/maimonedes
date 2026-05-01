@@ -1898,6 +1898,41 @@ def label_distribution_cmd(
         typer.echo(line)
 
 
+@app.command("backfill-llm-call-ids")
+def backfill_llm_call_ids_cmd(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print how many rows would be updated; don't write.",
+    ),
+    supervised_backend_prefix: str = typer.Option(
+        "ollama-supervised",
+        "--supervised-prefix",
+        help="LLMCall.backend_name prefix used to identify supervised rows.",
+    ),
+) -> None:
+    """One-time backfill of `compliance_scores.llm_call_id` for legacy rows.
+
+    Walks every `compliance_scores` row whose `llm_call_id` is NULL,
+    pairs it chronologically with a supervised `llm_calls` row that
+    isn't already claimed, and writes the FK. Idempotent — re-running
+    against an already-backfilled DB updates zero rows.
+    """
+    from maimonedes.storage.llm_calls import backfill_llm_call_ids
+    from maimonedes.storage.repo import init_engine
+
+    settings = get_settings()
+    init_engine(settings)
+    n = backfill_llm_call_ids(
+        supervised_backend_prefix=supervised_backend_prefix,
+        dry_run=dry_run,
+    )
+    if dry_run:
+        typer.echo(f"would update {n} compliance_scores row(s)")
+    else:
+        typer.echo(f"updated {n} compliance_scores row(s)")
+
+
 def main(argv: list[str] | None = None) -> None:
     """Console-script entry point.
 

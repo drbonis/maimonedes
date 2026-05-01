@@ -241,7 +241,12 @@ def _run_single(
             model=supervised_model,
             temperature=supervised_temperature,
         )
-        score = judge.score(policy, anchor, supervised_resp.content)
+        score = judge.score(
+            policy,
+            anchor,
+            supervised_resp.content,
+            llm_call_id=supervised_resp.llm_call_id,
+        )
         score = score.model_copy(
             update={
                 "perturbation_id": row_id,

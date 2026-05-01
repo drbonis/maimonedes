@@ -67,7 +67,12 @@ def run_once(
     )
 
     judge = Judge(judge_rc, model=judge_model, supervised_model=supervised_model)
-    score = judge.score(policy, anchor, supervised_response.content)
+    score = judge.score(
+        policy,
+        anchor,
+        supervised_response.content,
+        llm_call_id=supervised_response.llm_call_id,
+    )
 
     if persist:
         record_score(score)

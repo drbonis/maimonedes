@@ -104,6 +104,38 @@ def test_run_once_persists_score_and_returns_compliance_score(
     assert rows[0].aggregate == pytest.approx(1.0)
 
 
+def test_run_once_wires_supervised_llm_call_id_on_score(
+    db: str, policy: Policy
+) -> None:
+    """#44: persisted compliance_scores row carries the supervised FK."""
+    from maimonedes.storage.llm_calls import LLMCall
+
+    fake = _stitched_fake(policy)
+    anchors = load_anchors(PROBES_PATH)
+    run_once(
+        "A1",
+        policy=policy,
+        anchors=anchors,
+        supervised_client=fake,
+        judge_client=fake,
+        supervised_model="supervised:test",
+        judge_model="judge:test",
+    )
+
+    with get_session() as session:
+        sup_id = (
+            session.query(LLMCall.id)
+            .filter(LLMCall.backend_name == "ollama-supervised")
+            .scalar()
+        )
+        score_llm_call_id = (
+            session.query(ComplianceScoreRow.llm_call_id).scalar()
+        )
+    assert score_llm_call_id == sup_id, (
+        f"expected score.llm_call_id={sup_id}, got {score_llm_call_id}"
+    )
+
+
 def test_run_once_records_two_llm_calls_with_distinct_backend_names(
     db: str, policy: Policy
 ) -> None:

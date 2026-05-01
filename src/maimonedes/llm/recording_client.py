@@ -111,8 +111,8 @@ class RecordingClient:
                 update={"latency_ms": (time.perf_counter() - start) * 1000.0}
             )
 
-        self._persist(messages, model, response, request_hash)
-        return response
+        llm_call_id = self._persist(messages, model, response, request_hash)
+        return response.model_copy(update={"llm_call_id": llm_call_id})
 
     # ---- internals ---------------------------------------------------------
 
@@ -122,7 +122,7 @@ class RecordingClient:
         model: str,
         response: ChatResponse,
         request_hash: str,
-    ) -> None:
+    ) -> int:
         request_json = json.dumps(
             [{"role": m.role, "content": m.content} for m in messages],
             sort_keys=True,
@@ -130,19 +130,20 @@ class RecordingClient:
         )
         raw_json = json.dumps(response.raw, sort_keys=True, default=str, ensure_ascii=False)
         with get_session() as session:
-            session.add(
-                LLMCall(
-                    backend_name=self._backend_name,
-                    model=model,
-                    request_messages_json=request_json,
-                    response_content=response.content,
-                    raw_response_json=raw_json,
-                    prompt_tokens=response.prompt_tokens,
-                    completion_tokens=response.completion_tokens,
-                    latency_ms=response.latency_ms,
-                    request_hash=request_hash,
-                )
+            row = LLMCall(
+                backend_name=self._backend_name,
+                model=model,
+                request_messages_json=request_json,
+                response_content=response.content,
+                raw_response_json=raw_json,
+                prompt_tokens=response.prompt_tokens,
+                completion_tokens=response.completion_tokens,
+                latency_ms=response.latency_ms,
+                request_hash=request_hash,
             )
+            session.add(row)
+            session.flush()
+            return int(row.id)
 
     def _lookup_cached(self, request_hash: str) -> ChatResponse | None:
         with get_session() as session:
@@ -165,6 +166,7 @@ class RecordingClient:
                 completion_tokens=row.completion_tokens,
                 latency_ms=row.latency_ms,
                 raw=raw if isinstance(raw, dict) else {},
+                llm_call_id=int(row.id),
             )
 
 

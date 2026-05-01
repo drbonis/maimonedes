@@ -133,6 +133,49 @@ def test_run_perturbations_authority_only_persists_probes_and_scores(
     assert all(pid is not None for pid in perturbation_ids)
 
 
+def test_run_perturbations_wires_supervised_llm_call_id_on_each_score(
+    db: str, policy: Policy
+) -> None:
+    """#44: every perturbation score row carries a supervised FK."""
+    from maimonedes.storage.llm_calls import LLMCall
+
+    responses: list[ChatResponse] = []
+    for _ in range(4):
+        responses.append(_supervised_response())
+        responses.append(_judge_response(policy))
+    fake = FakeLLMClient(responses=responses)
+    anchors = load_anchors(PROBES_PATH)
+
+    run_perturbations(
+        "A1",
+        policy=policy,
+        anchors=anchors,
+        supervised_client=fake,
+        judge_client=fake,
+        generators=[AuthorityGenerator(AUTH_PATH)],
+        supervised_model="supervised:test",
+        judge_model="judge:test",
+    )
+
+    with get_session() as session:
+        score_data = [
+            (sr.id, sr.llm_call_id)
+            for sr in session.query(ComplianceScoreRow)
+            .order_by(ComplianceScoreRow.id)
+            .all()
+        ]
+        sup_ids = {
+            r.id
+            for r in session.query(LLMCall)
+            .filter(LLMCall.backend_name == "ollama-supervised")
+            .all()
+        }
+    assert len(score_data) == 4
+    for sr_id, llm_call_id in score_data:
+        assert llm_call_id is not None, sr_id
+        assert llm_call_id in sup_ids, sr_id
+
+
 def test_run_perturbations_with_baseline_computes_delta(
     db: str, policy: Policy
 ) -> None:

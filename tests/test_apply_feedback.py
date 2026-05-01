@@ -187,6 +187,53 @@ def test_apply_feedback_temporal_creates_recovery_run_and_feedbacks(
     assert summary.mean_delta_toward_baseline == pytest.approx(0.7)
 
 
+def test_apply_feedback_wires_supervised_llm_call_id_on_recovery_score(
+    db: str, policy: Policy
+) -> None:
+    """#44: recovery score row carries the supervised FK."""
+    from maimonedes.storage.compliance import ComplianceScoreRow
+    from maimonedes.storage.llm_calls import LLMCall
+
+    parent = _seed_drift_run(anchor_ids=("A1",))
+    anchors = [a for a in load_anchors(PROBES_PATH) if a.id == "A1"]
+    fake = FakeLLMClient(
+        responses=[
+            _feedback_response("Defer to the supervising physician."),
+            _supervised_response(),
+            _compliant_judge(policy),
+        ]
+    )
+    run_id, _ = apply_feedback(
+        parent,
+        policy=policy,
+        anchors=anchors,
+        supervised_client=fake,
+        judge_client=fake,
+        supervised_model="supervised:test",
+        judge_model="judge:test",
+        contrastive_kind="temporal",
+        top_k=1,
+    )
+
+    with get_session() as session:
+        recovery_data = [
+            (sr.id, sr.llm_call_id)
+            for sr in session.query(ComplianceScoreRow)
+            .filter(ComplianceScoreRow.recovery_run_id == run_id)
+            .all()
+        ]
+        sup_ids = {
+            r.id
+            for r in session.query(LLMCall)
+            .filter(LLMCall.backend_name == "ollama-supervised")
+            .all()
+        }
+    assert len(recovery_data) >= 1
+    for sr_id, llm_call_id in recovery_data:
+        assert llm_call_id is not None
+        assert llm_call_id in sup_ids
+
+
 def test_apply_feedback_per_anchor_feedback_unique_constraint(
     db: str, policy: Policy
 ) -> None:

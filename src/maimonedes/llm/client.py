@@ -30,6 +30,12 @@ class ChatResponse(BaseModel):
 
     `raw` carries the full backend response so debugging and replay are
     not lossy; downstream code should prefer the structured fields.
+
+    `llm_call_id` is set by `RecordingClient` after the row has been
+    inserted into `llm_calls`. Callers that need to wire the FK on a
+    derived `ComplianceScore` (or `Feedback`, `SynthesizedProbe`, ...)
+    read it from the response instead of re-querying the DB. Plain
+    backend clients leave it `None`.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -40,6 +46,7 @@ class ChatResponse(BaseModel):
     completion_tokens: int | None = None
     latency_ms: float = Field(ge=0.0)
     raw: dict[str, Any] = Field(default_factory=dict)
+    llm_call_id: int | None = None
 
 
 @runtime_checkable

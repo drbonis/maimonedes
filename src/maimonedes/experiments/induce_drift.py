@@ -202,7 +202,12 @@ def _run_one(
             model=supervised_model,
             temperature=supervised_temperature,
         )
-        score = judge.score(policy, anchor, supervised_resp.content)
+        score = judge.score(
+            policy,
+            anchor,
+            supervised_resp.content,
+            llm_call_id=supervised_resp.llm_call_id,
+        )
         score = score.model_copy(update={"drift_session_id": drift_session_id})
         record_score(score)
     except Exception as exc:  # network, judge JSON, persistence — all soft failures

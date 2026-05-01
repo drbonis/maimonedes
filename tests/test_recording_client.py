@@ -152,6 +152,26 @@ def test_replay_miss_falls_back_to_live_call(
 # ---- raw payload survives the round-trip -----------------------------------
 
 
+def test_pass_through_returns_response_with_llm_call_id_set(db: str) -> None:
+    """#44: live calls must return a ChatResponse whose llm_call_id is the row id."""
+    fake = FakeLLMClient(responses=["one"])
+    rc = RecordingClient(fake, backend_name="fake", replay=False)
+    resp = rc.chat_completion([_msg("hi")], model="m", temperature=0.0)
+    assert resp.llm_call_id is not None
+    with get_session() as session:
+        row_id = session.query(LLMCall.id).scalar()
+    assert resp.llm_call_id == row_id
+
+
+def test_replay_hit_response_carries_llm_call_id(db: str) -> None:
+    fake = FakeLLMClient(responses=["live"])
+    seeder = RecordingClient(fake, backend_name="fake", replay=False)
+    seeded = seeder.chat_completion([_msg("ping")], model="m", temperature=0.0)
+    rc = RecordingClient(fake, backend_name="fake", replay=True)
+    cached = rc.chat_completion([_msg("ping")], model="m", temperature=0.0)
+    assert cached.llm_call_id == seeded.llm_call_id
+
+
 def test_raw_payload_round_trip(db: str) -> None:
     canned = ChatResponse(
         content="hello",

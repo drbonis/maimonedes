@@ -173,6 +173,46 @@ def test_run_drift_persists_one_score_per_session_anchor(
         )
 
 
+def test_run_drift_wires_supervised_llm_call_id_on_each_score(
+    db: str, policy: Policy
+) -> None:
+    """#44: every drift score row carries a supervised FK."""
+    from maimonedes.storage.compliance import ComplianceScoreRow
+    from maimonedes.storage.llm_calls import LLMCall
+
+    schedule = DriftSchedule.from_yaml(SHORT_SCHEDULE_PATH)
+    anchors = [a for a in load_anchors(PROBES_PATH) if a.id == "A1"]
+    n_pairs = schedule.total_sessions
+    fake = FakeLLMClient(responses=_queue_for(policy, n_pairs))
+
+    run_drift(
+        schedule,
+        policy=policy,
+        anchors=anchors,
+        supervised_client=fake,
+        judge_client=fake,
+        supervised_model="supervised:test",
+        judge_model="judge:test",
+        schedule_path=str(SHORT_SCHEDULE_PATH),
+    )
+
+    with get_session() as session:
+        score_data = [
+            (sr.id, sr.llm_call_id)
+            for sr in session.query(ComplianceScoreRow).all()
+        ]
+        sup_ids = {
+            r.id
+            for r in session.query(LLMCall)
+            .filter(LLMCall.backend_name == "ollama-supervised")
+            .all()
+        }
+    assert len(score_data) > 0
+    for sr_id, llm_call_id in score_data:
+        assert llm_call_id is not None, sr_id
+        assert llm_call_id in sup_ids
+
+
 def test_run_drift_prepends_suffix_as_system_message(
     db: str, policy: Policy
 ) -> None:
