@@ -13,4 +13,5 @@ from maimonedes.storage import (  # noqa: F401
     models,
     perturbations,
     recovery,
+    structural_signals,
 )
