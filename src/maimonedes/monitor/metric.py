@@ -511,6 +511,81 @@ def _anchor_pair_from_jacobian(jac: Jacobian) -> _AnchorPair | None:
     )
 
 
+def _collect_anchor_pairs_window(
+    policy: Policy,
+    *,
+    start_session_id: int | None,
+    end_session_id: int | None,
+) -> list[_AnchorPair]:
+    """Window-scoped anchor pairs (issue #55).
+
+    Bypasses `monitor.fragility.all_jacobians()` (which has no
+    drift-session filter) and pulls compliance scores directly from
+    the DB, restricted to `drift_session_id` in
+    `[start_session_id, end_session_id]`. Anchor scores
+    (`probe_role="anchor"`) form the per-axis baseline; perturbation
+    scores (`probe_role="perturbation"`) build the Jacobian's J matrix.
+
+    Anchors with no anchor- or perturbation-scores in the window are
+    skipped; the caller decides whether the resulting empty result is
+    a usable training set.
+    """
+    from sqlalchemy import select
+
+    from maimonedes.storage.compliance import ComplianceScoreRow, row_to_score
+    from maimonedes.storage.repo import get_session
+
+    expected_axes = [s.id for s in policy.rubric.sub_conditions]
+    with get_session() as session:
+        stmt = select(ComplianceScoreRow).where(
+            ComplianceScoreRow.policy_id == policy.id
+        )
+        if start_session_id is not None:
+            stmt = stmt.where(
+                ComplianceScoreRow.drift_session_id >= start_session_id
+            )
+        if end_session_id is not None:
+            stmt = stmt.where(
+                ComplianceScoreRow.drift_session_id <= end_session_id
+            )
+        rows = session.execute(stmt).scalars().all()
+        scores = [row_to_score(r) for r in rows]
+
+    by_anchor: dict[str, list] = {}
+    for s in scores:
+        by_anchor.setdefault(s.anchor_id, []).append(s)
+
+    out: list[_AnchorPair] = []
+    for anchor_id, anchor_scores in by_anchor.items():
+        anchor_only = [s for s in anchor_scores if s.probe_role == "anchor"]
+        perturbed = [s for s in anchor_scores if s.probe_role == "perturbation"]
+        if not anchor_only or not perturbed:
+            continue
+        # Per-axis baseline = mean of anchor-stage scores in the window.
+        c_per_axis = {
+            a: float(np.mean([s.per_sub_condition.get(a, 0.0) for s in anchor_only]))
+            for a in expected_axes
+        }
+        c = np.asarray([c_per_axis[a] for a in expected_axes], dtype=np.float64)
+        J = np.zeros((len(perturbed), len(expected_axes)), dtype=np.float64)
+        for i, s in enumerate(perturbed):
+            for j, a in enumerate(expected_axes):
+                J[i, j] = s.per_sub_condition.get(a, 0.0) - c_per_axis[a]
+        norm_sq = float(np.sum(J * J))
+        if norm_sq <= 1e-12:
+            continue
+        g_target = (J.T @ J) / norm_sq
+        out.append(
+            _AnchorPair(
+                anchor_id=anchor_id,
+                c=c,
+                g_target=g_target,
+                n_perturbations=len(perturbed),
+            )
+        )
+    return out
+
+
 def _collect_anchor_pairs(policy: Policy) -> list[_AnchorPair]:
     """Build training pairs for every anchor with a usable Jacobian."""
     expected_axes = [s.id for s in policy.rubric.sub_conditions]
@@ -557,17 +632,39 @@ def fit_metric(
     epochs: int = 200,
     lr: float = 1e-2,
     seed: int = 0,
+    start_session_id: int | None = None,
+    end_session_id: int | None = None,
 ) -> RiemannianMetric:
     """Pull anchor Jacobians from the DB and fit a `RiemannianMetric`.
 
+    With `start_session_id` / `end_session_id` set, the training data is
+    scoped to compliance scores whose `drift_session_id` falls in that
+    range (issue #55) — used by `drift-report` to construct the two
+    metric fits curvature compares. Default behaviour (both kwargs
+    `None`) is unchanged: pulls every anchor Jacobian via
+    `monitor.fragility.all_jacobians()`.
+
     Raises `ValueError` when no anchors have usable Jacobians (e.g.,
-    `maimonedes perturb` has not been run yet).
+    `maimonedes perturb` has not been run yet, or the session window
+    is empty).
     """
-    pairs = _collect_anchor_pairs(policy)
-    if not pairs:
-        raise ValueError(
-            "fit_metric: no anchor Jacobians found; run `maimonedes perturb` first"
+    if start_session_id is not None or end_session_id is not None:
+        pairs = _collect_anchor_pairs_window(
+            policy,
+            start_session_id=start_session_id,
+            end_session_id=end_session_id,
         )
+        if not pairs:
+            raise ValueError(
+                f"fit_metric: no anchor scores in drift_session_id range "
+                f"[{start_session_id}, {end_session_id}]"
+            )
+    else:
+        pairs = _collect_anchor_pairs(policy)
+        if not pairs:
+            raise ValueError(
+                "fit_metric: no anchor Jacobians found; run `maimonedes perturb` first"
+            )
     expected_axes = tuple(s.id for s in policy.rubric.sub_conditions)
     k = len(expected_axes)
     c_array = np.stack([p.c for p in pairs], axis=0)

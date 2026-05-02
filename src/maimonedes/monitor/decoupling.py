@@ -47,6 +47,15 @@ from maimonedes.storage.repo import get_session
 
 SIGN_FLIP_EPS = 1e-3
 
+# Sentinel for the operator-tunable Frobenius-norm threshold (#55).
+# `decoupling_signal(h_decoupling=None)` auto-derives the per-anchor
+# threshold from baseline noise (`4 × ‖baseline_cov‖_F`); operators
+# overriding via the CLI pass a positive float. Zero means
+# "auto-derive" — kept distinct from the `None` sentinel so the CLI
+# can plumb a typed float through Click without an extra Optional flag
+# dance.
+DEFAULT_H_DECOUPLING: float = 0.0
+
 
 @dataclass(frozen=True)
 class DecouplingResult:

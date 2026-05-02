@@ -188,6 +188,7 @@ def _structural_signals_for_anchor(
     decoupling_baseline_window: int,
     decoupling_current_window: int,
     h_curvature: float,
+    h_decoupling: float | None,
 ) -> tuple[DecouplingResult | None, CurvatureResult | None]:
     """Run decoupling + curvature for one anchor, returning (None, None) when inputs missing."""
     decoupling: DecouplingResult | None = None
@@ -199,6 +200,7 @@ def _structural_signals_for_anchor(
                 axis_ids=axis_ids,
                 baseline_window=decoupling_baseline_window,
                 current_window=decoupling_current_window,
+                h_decoupling=h_decoupling,
             )
         except ValueError:
             # Insufficient samples — leave as None.
@@ -235,6 +237,7 @@ def build_report(
     decoupling_baseline_window: int = 50,
     decoupling_current_window: int = 20,
     h_curvature: float = DEFAULT_H_CURVATURE,
+    h_decoupling: float | None = None,
 ) -> DriftReport:
     """Assemble the detection-latency report for one drift run.
 
@@ -324,6 +327,7 @@ def build_report(
             decoupling_baseline_window=decoupling_baseline_window,
             decoupling_current_window=decoupling_current_window,
             h_curvature=h_curvature,
+            h_decoupling=h_decoupling,
         )
 
         rows.append(

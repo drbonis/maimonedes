@@ -1588,7 +1588,9 @@ def _format_report_table(report: DriftReport) -> list[str]:
 
     When `report.has_riemannian_columns` is True, two extra columns
     are appended: `eucl_d` and `riem_d` (worst-score displacement
-    from baseline, flat L2 vs learned metric).
+    from baseline, flat L2 vs learned metric). When
+    `report.has_structural_columns` is True, two more are appended:
+    `decoup` and `curv` showing per-anchor pass/fire (#55).
     """
     base_headers = [
         "anchor",
@@ -1601,10 +1603,12 @@ def _format_report_table(report: DriftReport) -> list[str]:
         "lead",
     ]
     has_riem = report.has_riemannian_columns
+    has_struct = report.has_structural_columns
+    headers = tuple(base_headers)
     if has_riem:
-        headers = (*base_headers, "eucl_d", "riem_d")
-    else:
-        headers = tuple(base_headers)
+        headers = (*headers, "eucl_d", "riem_d")
+    if has_struct:
+        headers = (*headers, "decoup", "curv")
     rows: list[tuple[str, ...]] = []
     for r in report.rows:
         if r.detector_skipped:
@@ -1661,6 +1665,16 @@ def _format_report_table(report: DriftReport) -> list[str]:
                 else "-"
             )
             row = (*row, eucl_d, riem_d)
+        if has_struct:
+            if r.decoupling is None:
+                decoup = "-"
+            else:
+                decoup = "fire" if r.decoupling_fired else "pass"
+            if r.curvature is None:
+                curv = "-"
+            else:
+                curv = "fire" if r.curvature_fired else "pass"
+            row = (*row, decoup, curv)
         rows.append(row)
     widths = [
         max(len(headers[i]), *(len(row[i]) for row in rows)) if rows else len(headers[i])
@@ -1699,8 +1713,49 @@ def drift_report_cmd(
         help="metric_fit id from `fit-metric`; when set, the report adds "
         "Euclidean and Riemannian displacement columns side by side.",
     ),
+    metric_baseline_id: int | None = typer.Option(
+        None,
+        "--metric-baseline",
+        help="metric_fit id for the baseline window; pair with --metric-current "
+        "to compute curvature drift (issue #55).",
+    ),
+    metric_current_id: int | None = typer.Option(
+        None,
+        "--metric-current",
+        help="metric_fit id for the current window; pair with --metric-baseline.",
+    ),
+    decoupling_baseline_window: int = typer.Option(
+        50,
+        "--decoupling-baseline-window",
+        help="Number of perturbation-stage scores in the decoupling baseline window.",
+    ),
+    decoupling_current_window: int = typer.Option(
+        20,
+        "--decoupling-current-window",
+        help="Number of perturbation-stage scores in the decoupling current window.",
+    ),
+    h_curvature: float = typer.Option(
+        0.5,  # mirrors monitor.curvature.DEFAULT_H_CURVATURE
+        "--h-curvature",
+        help="Curvature-drift threshold; signal fires when (κ_current - "
+        "κ_baseline) / κ_baseline exceeds this. See monitor.curvature.",
+    ),
+    h_decoupling: float = typer.Option(
+        0.0,  # 0 sentinel == auto-derive from baseline noise; see decoupling.py
+        "--h-decoupling",
+        help="Frobenius-norm threshold for decoupling. 0 (default) → auto-derive "
+        "as 4 × ‖baseline_cov‖_F per anchor.",
+    ),
 ) -> None:
     """Print detection-latency summary for a drift run."""
+    if (metric_baseline_id is None) != (metric_current_id is None):
+        typer.echo(
+            "--metric-baseline and --metric-current must be set together "
+            "(curvature requires two fits to compare).",
+            err=True,
+        )
+        raise typer.Exit(code=5)
+
     run = get_drift_run(run_id)
     if run is None:
         typer.echo(f"unknown drift_run_id: {run_id}", err=True)
@@ -1722,6 +1777,29 @@ def drift_report_cmd(
             raise typer.Exit(code=4)
         metric_obj = RiemannianMetric.load(Path(str(fit["path"])))
 
+    metric_baseline_obj: RiemannianMetric | None = None
+    metric_current_obj: RiemannianMetric | None = None
+    if metric_baseline_id is not None and metric_current_id is not None:
+        baseline_fit = get_metric_fit(metric_baseline_id)
+        if baseline_fit is None:
+            typer.echo(
+                f"unknown metric_fit_id for --metric-baseline: {metric_baseline_id}",
+                err=True,
+            )
+            raise typer.Exit(code=4)
+        current_fit = get_metric_fit(metric_current_id)
+        if current_fit is None:
+            typer.echo(
+                f"unknown metric_fit_id for --metric-current: {metric_current_id}",
+                err=True,
+            )
+            raise typer.Exit(code=4)
+        metric_baseline_obj = RiemannianMetric.load(Path(str(baseline_fit["path"])))
+        metric_current_obj = RiemannianMetric.load(Path(str(current_fit["path"])))
+
+    # Pass h_decoupling=None when sentinel 0 (auto-derive); else thread the value.
+    h_decoupling_arg: float | None = None if h_decoupling == 0.0 else h_decoupling
+
     try:
         report = build_report(
             run_id,
@@ -1731,6 +1809,12 @@ def drift_report_cmd(
             L=L,
             metric=metric_obj,
             metric_id=metric_id,
+            metric_baseline=metric_baseline_obj,
+            metric_current=metric_current_obj,
+            decoupling_baseline_window=decoupling_baseline_window,
+            decoupling_current_window=decoupling_current_window,
+            h_curvature=h_curvature,
+            h_decoupling=h_decoupling_arg,
         )
     except NoBaselineDataError as exc:
         typer.echo(f"insufficient baseline data: {exc}", err=True)
@@ -1742,6 +1826,9 @@ def drift_report_cmd(
     )
     for line in _format_report_table(report):
         typer.echo(line)
+
+    if report.has_structural_columns:
+        _persist_structural_signals(report)
 
     cusum_str = (
         f"{report.earliest_cusum_fire[0]} @ S{report.earliest_cusum_fire[1]}"
@@ -1764,6 +1851,60 @@ def drift_report_cmd(
         sign = "+" if headline > 0 else ""
         verdict = f"lead = {sign}{headline:.0f} sessions (violation - cusum)"
     typer.echo(f"headline:            {verdict}")
+
+
+def _persist_structural_signals(report: DriftReport) -> None:
+    """Idempotently record fired decoupling/curvature signals.
+
+    Uses the most-recent existing row per `(anchor_id, signal_type)` as
+    the natural-key check: if `metric_value` matches within 1e-6 of the
+    last persisted row, we skip the insert. Same data + same thresholds
+    → same metric_value → no duplicate row on re-run.
+    """
+    from maimonedes.storage.structural_signals import (
+        record_structural_signal,
+        signals_for_anchor,
+    )
+
+    for r in report.rows:
+        if r.decoupling_fired:
+            assert r.decoupling is not None
+            value = float(r.decoupling.frobenius_delta)
+            threshold = float(r.decoupling.h_decoupling)
+            existing = signals_for_anchor(
+                r.anchor_id, signal_type="decoupling", limit=1
+            )
+            if existing and abs(float(existing[0]["metric_value"]) - value) < 1e-6:
+                continue
+            record_structural_signal(
+                anchor_id=r.anchor_id,
+                signal_type="decoupling",
+                metric_value=value,
+                threshold=threshold,
+                evidence={
+                    "flipped_pairs": list(r.decoupling.flipped_pairs),
+                    "evidence_count": int(r.decoupling.evidence_count),
+                },
+            )
+        if r.curvature_fired:
+            assert r.curvature is not None
+            value = float(r.curvature.relative_increase)
+            threshold = float(r.curvature.h_curvature)
+            existing = signals_for_anchor(
+                r.anchor_id, signal_type="curvature", limit=1
+            )
+            if existing and abs(float(existing[0]["metric_value"]) - value) < 1e-6:
+                continue
+            record_structural_signal(
+                anchor_id=r.anchor_id,
+                signal_type="curvature",
+                metric_value=value,
+                threshold=threshold,
+                evidence={
+                    "baseline_curvature": float(r.curvature.baseline_curvature),
+                    "current_curvature": float(r.curvature.current_curvature),
+                },
+            )
 
 
 def _stream_recovery_progress(progress: RecoveryProgress) -> None:
@@ -2244,8 +2385,32 @@ def fit_metric_cmd(
         "--output-dir",
         help="Directory under which the trained metric `.npz` is written.",
     ),
+    start_session: int | None = typer.Option(
+        None,
+        "--start-session",
+        help="Restrict training to compliance scores whose drift_session_id "
+        ">= this value. Pair with --end-session to scope to a window "
+        "(issue #55).",
+    ),
+    end_session: int | None = typer.Option(
+        None,
+        "--end-session",
+        help="Restrict training to compliance scores whose drift_session_id "
+        "<= this value.",
+    ),
 ) -> None:
     """Fit a Riemannian metric on the anchor Jacobians and persist it."""
+    if (
+        start_session is not None
+        and end_session is not None
+        and start_session > end_session
+    ):
+        typer.echo(
+            f"--start-session ({start_session}) > --end-session ({end_session})",
+            err=True,
+        )
+        raise typer.Exit(code=5)
+
     try:
         policy = load_policy(policy_path, rubric_path)
     except FileNotFoundError as exc:
@@ -2261,10 +2426,15 @@ def fit_metric_cmd(
             l2=l2,
             lr=lr,
             seed=seed,
+            start_session_id=start_session,
+            end_session_id=end_session,
         )
     except ValueError as exc:
         typer.echo(f"fit failed: {exc}", err=True)
-        raise typer.Exit(code=2) from exc
+        # Empty session range → exit-4 (caller's window had no data); other
+        # config errors → exit-2 (matches existing convention).
+        code = 4 if (start_session is not None or end_session is not None) else 2
+        raise typer.Exit(code=code) from exc
 
     from datetime import datetime, timezone
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -2272,6 +2442,18 @@ def fit_metric_cmd(
     out_path = output_dir / f"metric_{policy.id}_{timestamp}.npz"
     metric.save(out_path)
 
+    hyperparams: dict[str, object] = {
+        "hidden": hidden,
+        "depth": depth,
+        "epochs": epochs,
+        "l2": l2,
+        "lr": lr,
+        "seed": seed,
+    }
+    if start_session is not None:
+        hyperparams["start_session_id"] = start_session
+    if end_session is not None:
+        hyperparams["end_session_id"] = end_session
     fit_id = record_metric_fit(
         policy_id=policy.id,
         path=str(out_path),
@@ -2279,18 +2461,17 @@ def fit_metric_cmd(
         n_jacobians=metric.n_jacobians,
         val_loss=metric.eval_metrics.get("val_loss"),
         train_loss=metric.eval_metrics.get("train_loss"),
-        hyperparams={
-            "hidden": hidden,
-            "depth": depth,
-            "epochs": epochs,
-            "l2": l2,
-            "lr": lr,
-            "seed": seed,
-        },
+        hyperparams=hyperparams,
     )
+    window_str = ""
+    if start_session is not None or end_session is not None:
+        lo = start_session if start_session is not None else "*"
+        hi = end_session if end_session is not None else "*"
+        window_str = f" window=[{lo}, {hi}]"
     typer.echo(
         f"metric_fit_id={fit_id} policy={policy.id} "
         f"n_anchors={metric.n_anchors} n_jacobians={metric.n_jacobians}"
+        f"{window_str}"
     )
     typer.echo(
         f"  train_loss={metric.eval_metrics.get('train_loss', float('nan')):.5f} "
