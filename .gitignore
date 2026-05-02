@@ -39,3 +39,4 @@ reports/
 
 # Local agent state
 .claude/
+models/
