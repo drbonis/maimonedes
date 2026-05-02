@@ -11,6 +11,7 @@ lives in:
 - pages/05_gp.py                  — Phase 5 GP uncertainty surface + targets
 - pages/06_metric.py              — Phase 5 Riemannian metric explorer
 - pages/07_curvature.py           — Phase 5 curvature alarm (κ change between fits)
+- pages/08_decoupling.py          — Phase 5 decoupling alarm (per-anchor covariance shift)
 
 Run with: `streamlit run src/maimonedes/dashboard/app.py`
 """
@@ -46,7 +47,11 @@ def _render() -> None:
         "with §4.6 Example 1 / 3 / 5 reproductions.\n"
         "- **Curvature — Phase 5**: per-anchor κ comparison between two "
         "metric_fits, eigenvalue-spectrum bars, ellipse-pair view, and the "
-        "persisted `structural_signals` curvature alarm feed."
+        "persisted `structural_signals` curvature alarm feed.\n"
+        "- **Decoupling — Phase 5**: per-anchor covariance shift — baseline "
+        "vs current k×k covariance heatmaps with sign-flip cells "
+        "highlighted, axis-pair scatter rotation with PC1 lines, and the "
+        "persisted decoupling alarm feed."
     )
 
 

@@ -126,6 +126,22 @@ def _recent_perturbation_scores(
         return [row_to_score(r) for r in rows]
 
 
+def anchors_with_perturbation_scores() -> list[str]:
+    """All distinct anchor ids that have at least one perturbation-stage score.
+
+    Used by the dashboard's decoupling page to populate the anchor
+    selector — anchors without perturbation rows have no covariance to
+    compare and so don't belong on the page.
+    """
+    with get_session() as session:
+        anchor_ids = session.execute(
+            select(ComplianceScoreRow.anchor_id)
+            .where(ComplianceScoreRow.probe_role == "perturbation")
+            .distinct()
+        ).scalars().all()
+    return sorted(anchor_ids)
+
+
 def compute_axis_covariance(
     *,
     anchor_id: str,
@@ -262,6 +278,7 @@ def decoupling_per_anchor(
 
 __all__ = [
     "DecouplingResult",
+    "anchors_with_perturbation_scores",
     "compute_axis_covariance",
     "decoupling_per_anchor",
     "decoupling_signal",
