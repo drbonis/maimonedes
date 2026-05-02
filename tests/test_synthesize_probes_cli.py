@@ -429,3 +429,269 @@ def test_synthesize_probes_cli_invalid_scorer_rejected(
         ["synthesize-probes", "1", "--scorer", "bogus", "--dry-run"],
     )
     assert result.exit_code != 0
+
+
+# ---- #52: gradient strategy ------------------------------------------------
+
+
+def _stage2_with_unit_coef(policy: Policy, *, feature_dim: int = 8) -> "Stage2Model":  # noqa: F821
+    """Synthetic Stage-2 with one ridge head per axis, all coefs ones."""
+    from datetime import datetime, timezone
+
+    import numpy as np
+    from sklearn.linear_model import Ridge
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    from maimonedes.models.stage2 import AxisMetrics, Stage2Model
+
+    heads: dict = {}
+    X_fit = np.array(
+        [np.ones(feature_dim), -np.ones(feature_dim)], dtype=float
+    )
+    for sub in policy.rubric.sub_conditions:
+        ridge = Ridge(alpha=1e-9)
+        ridge.coef_ = np.ones(feature_dim, dtype=float)
+        ridge.intercept_ = 0.5
+        ridge.n_features_in_ = feature_dim
+        scaler = StandardScaler()
+        scaler.fit(X_fit)
+        heads[sub.id] = Pipeline([("scaler", scaler), ("head", ridge)])
+    return Stage2Model(
+        policy_id=policy.id,
+        trained_at=datetime.now(timezone.utc),
+        n_samples=2,
+        n_train=2,
+        n_eval=0,
+        embedding_model="fake-embed",
+        feature_dim=feature_dim,
+        heads=heads,
+        agreement_metrics=[
+            AxisMetrics(sub_id=s.id, mae=0.0, spearman_rho=1.0)
+            for s in policy.rubric.sub_conditions
+        ],
+        agreement_status="green",
+    )
+
+
+def test_synthesize_probes_strategy_gradient_persists_generation_method(
+    db: str, policy: Policy, anchors, tmp_path: Path
+) -> None:
+    """Issue #52: strategy='gradient' results in probes recorded as 'gradient_v1'."""
+    _seed_supervised_pairs(policy)
+    fit_id, gp = _seed_gp_fit(policy, anchors, tmp_path)
+    stage2 = _stage2_with_unit_coef(policy)
+
+    target_dim = 8
+    matching = [1.0] + [0.0] * (target_dim - 1)
+    n = 1
+    n_library = sum(1 for a in anchors if a.policy_id == policy.id)
+    embed_fake = FakeEmbedClient(default_dim=target_dim)
+    for _ in range(n_library):
+        embed_fake.queue(
+            EmbedResponse(
+                embedding=[0.1] * target_dim,
+                model="fake-embed",
+                latency_ms=0.0,
+            )
+        )
+    for _ in range(n):
+        embed_fake.queue(
+            EmbedResponse(embedding=matching, model="fake-embed", latency_ms=0.0)
+        )
+
+    chat_responses = []
+    for _ in range(n):
+        chat_responses.extend(
+            [
+                ChatResponse(content="Generated.", model="gen:test", latency_ms=0.0),
+                ChatResponse(content="yes: realistic.", model="val:test", latency_ms=0.0),
+                ChatResponse(content="Reply.", model="sup:test", latency_ms=0.0),
+                ChatResponse(
+                    content=payload_json_for_target(policy, 0.85),
+                    model="judge:test",
+                    latency_ms=0.0,
+                ),
+            ]
+        )
+    fake_llm = FakeLLMClient(responses=chat_responses)
+
+    summary = synthesize_probes(
+        gp_fit=gp,
+        n_targets=n,
+        embed_client=embed_fake,
+        generator_client=fake_llm,
+        validator_client=fake_llm,
+        supervised_client=fake_llm,
+        judge_client=fake_llm,
+        embedding_model="fake-embed",
+        generator_model="gen:test",
+        validator_model="val:test",
+        supervised_model="sup:test",
+        judge_model="judge:test",
+        policy=policy,
+        anchors=anchors,
+        scorer="judge",
+        stage2_model=stage2,
+        gp_fit_id=fit_id,
+        tau=-1.0,
+        max_retries=0,
+        strategy="gradient",
+        gradient_axis_id=policy.rubric.sub_conditions[0].id,
+    )
+    assert summary.n_targets == n
+    assert summary.generation_method == "gradient_v1"
+    persisted = list_synthesized_probes(policy_id=policy.id)
+    assert len(persisted) == n
+    for probe in persisted:
+        assert probe.generation_method == "gradient_v1"
+
+
+def test_synthesize_probes_strategy_gradient_without_stage2_raises(
+    db: str, policy: Policy, anchors, tmp_path: Path
+) -> None:
+    _seed_supervised_pairs(policy)
+    fit_id, gp = _seed_gp_fit(policy, anchors, tmp_path)
+    embed_fake = FakeEmbedClient(default_dim=8)
+    fake_llm = FakeLLMClient()
+    with pytest.raises(ValueError, match="strategy='gradient' requires a Stage2Model"):
+        synthesize_probes(
+            gp_fit=gp,
+            n_targets=1,
+            embed_client=embed_fake,
+            generator_client=fake_llm,
+            validator_client=fake_llm,
+            supervised_client=fake_llm,
+            judge_client=fake_llm,
+            embedding_model="fake-embed",
+            generator_model="gen:test",
+            validator_model="val:test",
+            supervised_model="sup:test",
+            judge_model="judge:test",
+            policy=policy,
+            anchors=anchors,
+            stage2_model=None,
+            gp_fit_id=fit_id,
+            strategy="gradient",
+        )
+
+
+def test_synthesize_probes_unknown_strategy_raises(
+    db: str, policy: Policy, anchors, tmp_path: Path
+) -> None:
+    _seed_supervised_pairs(policy)
+    fit_id, gp = _seed_gp_fit(policy, anchors, tmp_path)
+    embed_fake = FakeEmbedClient(default_dim=8)
+    fake_llm = FakeLLMClient()
+    with pytest.raises(ValueError, match="unknown strategy"):
+        synthesize_probes(
+            gp_fit=gp,
+            n_targets=1,
+            embed_client=embed_fake,
+            generator_client=fake_llm,
+            validator_client=fake_llm,
+            supervised_client=fake_llm,
+            judge_client=fake_llm,
+            embedding_model="fake-embed",
+            generator_model="gen:test",
+            validator_model="val:test",
+            supervised_model="sup:test",
+            judge_model="judge:test",
+            policy=policy,
+            anchors=anchors,
+            gp_fit_id=fit_id,
+            strategy="bogus",  # type: ignore[arg-type]
+        )
+
+
+def test_synthesize_probes_cli_strategy_gradient_dry_run(
+    db: str, policy: Policy, anchors, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_supervised_pairs(policy)
+    fit_id, _gp = _seed_gp_fit(policy, anchors, tmp_path)
+    stage2 = _stage2_with_unit_coef(policy)
+    stage2_path = tmp_path / "stage2_grad.pkl"
+    stage2.save(stage2_path)
+    stage2_id = record_stage2_model(
+        path=str(stage2_path),
+        policy_id=policy.id,
+        n_samples=stage2.n_samples,
+        embedding_model=stage2.embedding_model,
+        mae_per_axis={m.sub_id: m.mae for m in stage2.agreement_metrics},
+        spearman_per_axis={m.sub_id: m.spearman_rho for m in stage2.agreement_metrics},
+        agreement_status=stage2.agreement_status,
+        head_kind=stage2.head_kind,
+    )
+
+    fake_embed = FakeEmbedClient(default_dim=8)
+    fake_chat = FakeLLMClient()
+    monkeypatch.setattr(cli, "_embed_factory", lambda s: fake_embed)
+    monkeypatch.setattr(cli, "_backend_factory", lambda s: fake_chat)
+
+    result = runner.invoke(
+        app,
+        [
+            "synthesize-probes",
+            str(fit_id),
+            "--n",
+            "2",
+            "--strategy",
+            "gradient",
+            "--stage2-model",
+            str(stage2_id),
+            "--gradient-axis",
+            policy.rubric.sub_conditions[0].id,
+            "--policy",
+            str(POLICY_PATH),
+            "--rubric",
+            str(RUBRIC_PATH),
+            "--probes",
+            str(PROBES_PATH),
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "strategy=gradient" in result.output
+    assert "n_targets=2" in result.output
+    # No chat calls in dry-run.
+    assert fake_chat.calls == []
+
+
+def test_synthesize_probes_cli_strategy_gradient_without_stage2_id_exits_5(
+    db: str, policy: Policy, anchors, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_supervised_pairs(policy)
+    fit_id, _gp = _seed_gp_fit(policy, anchors, tmp_path)
+    monkeypatch.setattr(cli, "_embed_factory", lambda s: FakeEmbedClient())
+    monkeypatch.setattr(cli, "_backend_factory", lambda s: FakeLLMClient())
+    result = runner.invoke(
+        app,
+        [
+            "synthesize-probes",
+            str(fit_id),
+            "--strategy",
+            "gradient",
+            "--policy",
+            str(POLICY_PATH),
+            "--rubric",
+            str(RUBRIC_PATH),
+            "--probes",
+            str(PROBES_PATH),
+        ],
+    )
+    assert result.exit_code == 5
+    assert "stage2-model" in result.output
+
+
+def test_synthesize_probes_cli_invalid_strategy_rejected(
+    db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_embed_factory", lambda s: FakeEmbedClient())
+    monkeypatch.setattr(cli, "_backend_factory", lambda s: FakeLLMClient())
+    result = runner.invoke(
+        app,
+        ["synthesize-probes", "1", "--strategy", "wrong", "--dry-run"],
+    )
+    assert result.exit_code != 0

@@ -17,7 +17,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
-GenerationMethod = Literal["knn_exemplar"]
+GenerationMethod = Literal["knn_exemplar", "gradient_v1"]
 QualityStatus = Literal["approved", "rejected", "pending"]
 
 

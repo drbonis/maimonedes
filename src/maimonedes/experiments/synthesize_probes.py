@@ -21,6 +21,11 @@ from typing import Literal
 from maimonedes.core.compliance import ComplianceScore
 from maimonedes.core.policy import Policy
 from maimonedes.core.probe import AnchorProbe
+from maimonedes.core.synthesized_probe import GenerationMethod
+from maimonedes.feedback.gradient_targets import (
+    GradientTarget,
+    propose_gradient_targets,
+)
 from maimonedes.feedback.probe_synthesis import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_TAU,
@@ -49,13 +54,20 @@ JUDGE_BACKEND_NAME = "ollama-judge"
 EMBED_BACKEND_NAME = "clinicalbert"
 
 ScorerKind = Literal["judge", "classifier"]
+SynthesisStrategy = Literal["knn", "gradient"]
 
 
 @dataclass
 class TargetOutcome:
-    """One target → one synthesized probe → optionally one score."""
+    """One target → one synthesized probe → optionally one score.
 
-    target: GPTarget
+    `target` is the embedding-space target the synthesizer aimed at.
+    For `strategy="gradient"` it carries the FINAL position of the
+    gradient trajectory; for `strategy="knn"` it is a `GPTarget`
+    directly from `propose_targets`.
+    """
+
+    target: GPTarget | GradientTarget
     synthesis: SynthesisResult
     synthesized_probe_id: int | None
     score: ComplianceScore | None
@@ -78,7 +90,7 @@ class SynthesisProgress:
     """Streamed once per target so callers can show live progress."""
 
     target_index: int
-    target: GPTarget
+    target: GPTarget | GradientTarget
     outcome: TargetOutcome
 
 
@@ -110,11 +122,32 @@ def synthesize_probes(
     on_progress: ProgressCallback | None = None,
     candidate_pool_size: int = 1000,
     seed: int = 0,
+    strategy: SynthesisStrategy = "knn",
+    gradient_axis_id: str | None = None,
+    gradient_step: float | None = None,
 ) -> SynthesisRunSummary:
-    """Generate `n_targets` synthesized probes; optionally score each."""
+    """Generate `n_targets` synthesized probes; optionally score each.
+
+    `strategy="knn"` (default) is the issue-#42 K-NN exemplar synthesizer
+    fed by `propose_targets(gp)`. `strategy="gradient"` (#52) replaces
+    the seeds with `propose_gradient_targets(gp, stage2)` — each GP
+    seed is stepped along the Stage-2 score-descent direction in
+    embedding space until either a violation threshold or an
+    uncertainty cap is hit. The K-NN synthesizer still draws the text
+    (with re-embed + τ check + LLM-as-validator), so quality gating is
+    identical across strategies.
+    """
     if scorer == "classifier" and stage2_model is None:
         raise ValueError(
             "scorer='classifier' requires a Stage2Model passed via stage2_model"
+        )
+    if strategy == "gradient" and stage2_model is None:
+        raise ValueError(
+            "strategy='gradient' requires a Stage2Model passed via stage2_model"
+        )
+    if strategy not in ("knn", "gradient"):
+        raise ValueError(
+            f"unknown strategy {strategy!r}; expected 'knn' or 'gradient'"
         )
 
     anchor_list = [a for a in anchors if a.policy_id == policy.id]
@@ -159,12 +192,29 @@ def synthesize_probes(
         max_retries=max_retries,
     )
 
-    targets = propose_targets(
-        gp_fit,
-        n_targets=n_targets,
-        candidate_pool_size=candidate_pool_size,
-        seed=seed,
-    )
+    targets: list[GPTarget] | list[GradientTarget]
+    generation_method: GenerationMethod
+    if strategy == "gradient":
+        assert stage2_model is not None  # validated above
+        targets = propose_gradient_targets(
+            gp=gp_fit,
+            stage2=stage2_model,
+            policy=policy,
+            n_targets=n_targets,
+            step=gradient_step,
+            axis_id=gradient_axis_id,
+            candidate_pool_size=candidate_pool_size,
+            seed=seed,
+        )
+        generation_method = "gradient_v1"
+    else:
+        targets = propose_targets(
+            gp_fit,
+            n_targets=n_targets,
+            candidate_pool_size=candidate_pool_size,
+            seed=seed,
+        )
+        generation_method = "knn_exemplar"
 
     n_approved = 0
     n_rejected_tau = 0
@@ -175,7 +225,10 @@ def synthesize_probes(
     for i, target in enumerate(targets, start=1):
         result = synthesizer.synthesize(target.embedding)
         probe = to_synthesized_probe(
-            result, policy_id=policy.id, gp_fit_id=gp_fit_id
+            result,
+            policy_id=policy.id,
+            gp_fit_id=gp_fit_id,
+            generation_method=generation_method,
         )
         try:
             probe_id = record_synthesized_probe(probe)
@@ -254,6 +307,7 @@ def synthesize_probes(
         n_rejected_validator=n_rejected_validator,
         n_scored=n_scored,
         mean_aggregate=mean_aggregate,
+        generation_method=generation_method,
     )
 
 

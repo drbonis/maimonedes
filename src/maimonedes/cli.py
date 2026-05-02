@@ -784,7 +784,28 @@ def synthesize_probes_cmd(
     stage2_model_id: int | None = typer.Option(
         None,
         "--stage2-model",
-        help="stage2_models.id to use when --scorer=classifier.",
+        help="stage2_models.id to use when --scorer=classifier or "
+        "--strategy=gradient.",
+    ),
+    strategy: str = typer.Option(
+        "knn",
+        "--strategy",
+        help="Target proposal: 'knn' (default; GP-proposed seeds → K-NN "
+        "exemplar synthesizer) or 'gradient' (#52; each GP seed is "
+        "stepped along the Stage-2 score-descent direction before being "
+        "fed to the K-NN synthesizer). 'gradient' requires --stage2-model.",
+    ),
+    gradient_axis_id: str | None = typer.Option(
+        None,
+        "--gradient-axis",
+        help="Sub-condition id whose Stage-2 score the gradient descends. "
+        "Defaults to the policy's worst-fragility axis.",
+    ),
+    gradient_step: float | None = typer.Option(
+        None,
+        "--gradient-step",
+        help="Step size for gradient stepping. Defaults to 0.1 × the GP "
+        "kernel's length scale.",
     ),
     policy_path: Path = typer.Option(DEFAULT_POLICY_PATH, "--policy"),
     rubric_path: Path = typer.Option(DEFAULT_RUBRIC_PATH, "--rubric"),
@@ -805,6 +826,15 @@ def synthesize_probes_cmd(
         raise typer.BadParameter(
             f"--scorer must be 'judge' or 'classifier', got {scorer!r}"
         )
+    if strategy not in ("knn", "gradient"):
+        raise typer.BadParameter(
+            f"--strategy must be 'knn' or 'gradient', got {strategy!r}"
+        )
+    if strategy == "gradient" and stage2_model_id is None:
+        typer.echo(
+            "--strategy=gradient requires --stage2-model <id>", err=True
+        )
+        raise typer.Exit(code=5)
     if scorer == "classifier" and stage2_model_id is None:
         typer.echo(
             "--scorer=classifier requires --stage2-model <id>", err=True
@@ -845,6 +875,45 @@ def synthesize_probes_cmd(
     validator_model = validator_model or settings.ollama_judge_model
 
     if dry_run:
+        if strategy == "gradient":
+            from maimonedes.feedback.gradient_targets import (
+                propose_gradient_targets as _propose_gradient_targets,
+            )
+
+            if stage2_model_id is None:
+                typer.echo(
+                    "--strategy=gradient --dry-run requires --stage2-model <id>",
+                    err=True,
+                )
+                raise typer.Exit(code=5)
+            stage2_row = get_stage2_model(stage2_model_id)
+            if stage2_row is None:
+                typer.echo(
+                    f"unknown stage2_model id: {stage2_model_id}", err=True
+                )
+                raise typer.Exit(code=4)
+            stage2 = Stage2Model.load(stage2_row.path)
+            grad_targets = _propose_gradient_targets(
+                gp=gp,
+                stage2=stage2,
+                policy=policy,
+                n_targets=n,
+                axis_id=gradient_axis_id,
+                step=gradient_step,
+                candidate_pool_size=500,
+                seed=0,
+            )
+            typer.echo(
+                f"gp_fit_id={gp_fit_id} n_targets={len(grad_targets)} "
+                f"strategy=gradient (dry-run, no LLM calls)"
+            )
+            for i, t in enumerate(grad_targets, start=1):
+                typer.echo(
+                    f"  G{i:02d}  axis={t.axis_id} steps={t.n_steps_taken} "
+                    f"stop={t.stop_reason} expected={t.expected_score:+.3f} "
+                    f"uncertainty={t.uncertainty:.3f}"
+                )
+            return
         targets = propose_targets(gp, n_targets=n, candidate_pool_size=500, seed=0)
         typer.echo(
             f"gp_fit_id={gp_fit_id} n_targets={len(targets)} (dry-run, no LLM calls)"
@@ -864,7 +933,7 @@ def synthesize_probes_cmd(
         return
 
     stage2_model = None
-    if scorer == "classifier":
+    if scorer == "classifier" or strategy == "gradient":
         stage2_row = get_stage2_model(stage2_model_id)  # type: ignore[arg-type]
         if stage2_row is None:
             typer.echo(
@@ -898,6 +967,9 @@ def synthesize_probes_cmd(
             tau=tau,
             max_retries=max_retries,
             replay=replay,
+            strategy=strategy,  # type: ignore[arg-type]
+            gradient_axis_id=gradient_axis_id,
+            gradient_step=gradient_step,
             on_progress=_stream_synthesis_progress,
         )
     except ValueError as exc:

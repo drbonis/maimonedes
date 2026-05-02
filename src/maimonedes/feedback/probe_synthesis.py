@@ -341,12 +341,18 @@ def to_synthesized_probe(
     *,
     policy_id: str,
     gp_fit_id: int | None,
+    generation_method: GenerationMethod = "knn_exemplar",
 ) -> SynthesizedProbe:
-    """Convenience: shape a `SynthesisResult` into a persistable row."""
+    """Convenience: shape a `SynthesisResult` into a persistable row.
+
+    `generation_method` records the strategy that produced the target
+    embedding (issue #52). The text-generation pipeline is K-NN
+    exemplar in either case — only the seed differs.
+    """
     return SynthesizedProbe(
         policy_id=policy_id,
         scenario=result.scenario,
-        generation_method="knn_exemplar",
+        generation_method=generation_method,
         target_embedding=result.target_embedding,
         achieved_embedding=result.achieved_embedding,
         tau_distance=result.tau_distance,
