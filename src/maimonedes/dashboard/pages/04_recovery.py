@@ -59,9 +59,14 @@ def _cached_runs() -> list[RecoveryRunSnapshot]:
         started = run.get("started_at")
         notes = run.get("notes")
         kind = str(run.get("contrastive_kind", ""))
+        contamination_mode = str(run.get("contamination_mode") or "clean")
+        raw_stage_label = run.get("contamination_stage_label")
+        stage_label = str(raw_stage_label) if raw_stage_label else None
         label_parts: list[str] = [f"recovery #{run['id']}"]
         label_parts.append(f"parent drift #{run['parent_drift_run_id']}")
         label_parts.append(f"kind={kind}")
+        if contamination_mode != "clean":
+            label_parts.append(f"contam={contamination_mode}")
         if isinstance(started, datetime):
             label_parts.append(started.strftime("%Y-%m-%d %H:%M"))
         if notes:
@@ -76,6 +81,8 @@ def _cached_runs() -> list[RecoveryRunSnapshot]:
                 notes=str(notes) if notes else None,
                 contrastive_kind=kind,
                 label="  ·  ".join(label_parts),
+                contamination_mode=contamination_mode,
+                contamination_stage_label=stage_label,
             )
         )
     return snapshots
@@ -222,6 +229,28 @@ def _render() -> None:
         index=0,
     )
     snap = run_labels[chosen_label]
+
+    # The contamination mode shifts how the verdict is read: a +Δ
+    # under "clean" tests "feedback works once contamination stops",
+    # while the same +Δ under per_anchor_worst / fixed_stage tests
+    # "feedback works while contamination continues" (#35).
+    if snap.contamination_mode == "clean":
+        st.caption("Contamination mode: **clean** (feedback only)")
+    elif snap.contamination_mode == "per_anchor_worst":
+        st.caption(
+            "Contamination mode: **per_anchor_worst** — each anchor was "
+            "re-evaluated under the suffix from its worst-aggregate session."
+        )
+    elif snap.contamination_mode.startswith("fixed_stage:"):
+        stage = snap.contamination_stage_label or snap.contamination_mode.split(
+            ":", 1
+        )[1]
+        st.caption(
+            f"Contamination mode: **fixed_stage** — every anchor was "
+            f"re-evaluated under the `{stage}` stage suffix."
+        )
+    else:
+        st.caption(f"Contamination mode: **{snap.contamination_mode}**")
 
     report = _cached_report(snap.recovery_run_id)
     if report is None:

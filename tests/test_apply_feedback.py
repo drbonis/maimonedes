@@ -495,6 +495,349 @@ def test_apply_feedback_cli_unknown_anchor_id_exits_4(
     assert "unknown anchor" in result.output
 
 
+# ---- #35: keep-contamination ------------------------------------------------
+
+
+def _seed_drift_run_with_distinct_stages(
+    *,
+    anchor_id: str = "A1",
+) -> tuple[int, str]:
+    """Drift run where the anchor's worst aggregate is in a known stage.
+
+    Returns (drift_run_id, expected_suffix). Uses two stages with distinct
+    suffixes so a per-anchor-worst lookup can be verified by suffix
+    comparison.
+    """
+    run_id = create_drift_run(
+        policy_id="scope_of_practice",
+        supervised_model="llama:test",
+        judge_model="judge:test",
+        schedule_path="config/drift/scope_of_practice_v1.yaml",
+    )
+    sub_ids = (
+        "flags_physician_review",
+        "expresses_uncertainty",
+        "avoids_unqualified_prescriptive_language",
+        "recommendation_within_scope",
+        "recommendation_appropriate_specificity",
+    )
+    # Two sessions: baseline (good score), concise (bad score).
+    sid_baseline = create_drift_session(run_id, 0, "baseline", "BASELINE_SUFFIX")
+    sid_concise = create_drift_session(run_id, 1, "concise", "CONCISE_SUFFIX")
+    record_score(
+        ComplianceScore(
+            anchor_id=anchor_id,
+            policy_id="scope_of_practice",
+            per_sub_condition={s: 0.9 for s in sub_ids},
+            aggregate=0.9,
+            judge_model="judge:test",
+            supervised_model="llama:test",
+            drift_session_id=sid_baseline,
+        )
+    )
+    record_score(
+        ComplianceScore(
+            anchor_id=anchor_id,
+            policy_id="scope_of_practice",
+            per_sub_condition={s: 0.2 for s in sub_ids},
+            aggregate=0.2,
+            judge_model="judge:test",
+            supervised_model="llama:test",
+            drift_session_id=sid_concise,
+        )
+    )
+    return run_id, "CONCISE_SUFFIX"
+
+
+def _supervised_messages(
+    fake: FakeLLMClient, supervised_model: str = "m"
+) -> list[list[str]]:
+    """Return the system-message contents from supervised-model calls only.
+
+    Tests pass distinct strings for `supervised_model` ("m") and
+    `judge_model` ("j") so we can isolate the supervised round-trips from
+    the synthesizer/judge round-trips on the same FakeLLMClient.
+    """
+    out: list[list[str]] = []
+    for c in fake.calls:
+        if c.model != supervised_model:
+            continue
+        out.append([m.content for m in c.messages if m.role == "system"])
+    return out
+
+
+def test_apply_feedback_default_mode_is_clean(db: str, policy: Policy) -> None:
+    parent = _seed_drift_run(anchor_ids=("A1",))
+    anchors = [a for a in load_anchors(PROBES_PATH) if a.id == "A1"]
+    fake = FakeLLMClient(
+        responses=[
+            _feedback_response("Defer."),
+            _supervised_response(),
+            _compliant_judge(policy),
+        ]
+    )
+    run_id, _ = apply_feedback(
+        parent,
+        policy=policy,
+        anchors=anchors,
+        supervised_client=fake,
+        judge_client=fake,
+        supervised_model="m",
+        judge_model="j",
+        contrastive_kind="temporal",
+        top_k=1,
+    )
+    run = get_recovery_run(run_id)
+    assert run is not None
+    assert run["contamination_mode"] == "clean"
+    assert run["contamination_stage_label"] is None
+
+    # Supervised call has feedback as its only system message; the judge
+    # and synthesizer rounds use a different model and aren't included.
+    sup_systems = _supervised_messages(fake, supervised_model="m")
+    assert len(sup_systems) == 1
+    assert sup_systems[0] == ["Defer."]
+
+
+def test_apply_feedback_per_anchor_worst_uses_worst_session_suffix(
+    db: str, policy: Policy
+) -> None:
+    parent, expected_suffix = _seed_drift_run_with_distinct_stages(anchor_id="A1")
+    anchors = [a for a in load_anchors(PROBES_PATH) if a.id == "A1"]
+    fake = FakeLLMClient(
+        responses=[
+            _feedback_response("Always defer."),
+            _supervised_response(),
+            _compliant_judge(policy),
+        ]
+    )
+    run_id, _ = apply_feedback(
+        parent,
+        policy=policy,
+        anchors=anchors,
+        supervised_client=fake,
+        judge_client=fake,
+        supervised_model="m",
+        judge_model="j",
+        contrastive_kind="temporal",
+        top_k=1,
+        keep_contamination=True,
+    )
+    run = get_recovery_run(run_id)
+    assert run is not None
+    assert run["contamination_mode"] == "per_anchor_worst"
+    assert run["contamination_stage_label"] is None
+
+    sup_systems = _supervised_messages(fake, supervised_model="m")
+    assert len(sup_systems) == 1
+    # Feedback first, then the contamination suffix from the worst session.
+    assert sup_systems[0] == ["Always defer.", expected_suffix]
+
+
+def test_apply_feedback_fixed_stage_uses_named_stage_suffix(
+    db: str, policy: Policy
+) -> None:
+    parent, _ = _seed_drift_run_with_distinct_stages(anchor_id="A1")
+    anchors = [a for a in load_anchors(PROBES_PATH) if a.id == "A1"]
+    fake = FakeLLMClient(
+        responses=[
+            _feedback_response("Defer."),
+            _supervised_response(),
+            _compliant_judge(policy),
+        ]
+    )
+    run_id, _ = apply_feedback(
+        parent,
+        policy=policy,
+        anchors=anchors,
+        supervised_client=fake,
+        judge_client=fake,
+        supervised_model="m",
+        judge_model="j",
+        contrastive_kind="temporal",
+        top_k=1,
+        keep_contamination=True,
+        contamination_stage="baseline",  # different from the per-anchor worst
+    )
+    run = get_recovery_run(run_id)
+    assert run is not None
+    assert run["contamination_mode"] == "fixed_stage:baseline"
+    assert run["contamination_stage_label"] == "baseline"
+
+    sup_systems = _supervised_messages(fake, supervised_model="m")
+    assert len(sup_systems) == 1
+    assert sup_systems[0] == ["Defer.", "BASELINE_SUFFIX"]
+
+
+def test_apply_feedback_fixed_stage_without_keep_contamination_raises(
+    db: str, policy: Policy
+) -> None:
+    parent, _ = _seed_drift_run_with_distinct_stages(anchor_id="A1")
+    anchors = [a for a in load_anchors(PROBES_PATH) if a.id == "A1"]
+    fake = FakeLLMClient(responses=[])
+    with pytest.raises(ValueError, match="keep_contamination is False"):
+        apply_feedback(
+            parent,
+            policy=policy,
+            anchors=anchors,
+            supervised_client=fake,
+            judge_client=fake,
+            supervised_model="m",
+            judge_model="j",
+            contamination_stage="concise",
+        )
+
+
+def test_apply_feedback_unknown_contamination_stage_raises(
+    db: str, policy: Policy
+) -> None:
+    parent, _ = _seed_drift_run_with_distinct_stages(anchor_id="A1")
+    anchors = [a for a in load_anchors(PROBES_PATH) if a.id == "A1"]
+    fake = FakeLLMClient(responses=[])
+    with pytest.raises(ValueError, match="not in"):
+        apply_feedback(
+            parent,
+            policy=policy,
+            anchors=anchors,
+            supervised_client=fake,
+            judge_client=fake,
+            supervised_model="m",
+            judge_model="j",
+            keep_contamination=True,
+            contamination_stage="bogus_stage",  # type: ignore[arg-type]
+        )
+
+
+def test_apply_feedback_cli_under_contamination_persists_mode(
+    db: str, policy: Policy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent, expected_suffix = _seed_drift_run_with_distinct_stages(anchor_id="A1")
+    fake = FakeLLMClient(
+        responses=[
+            _feedback_response("Defer."),
+            _supervised_response(),
+            _compliant_judge(policy),
+        ]
+    )
+    monkeypatch.setattr(cli, "_backend_factory", lambda s: fake)
+    result = runner.invoke(
+        app,
+        [
+            "apply-feedback",
+            str(parent),
+            "--top-k",
+            "1",
+            "--anchors",
+            "A1",
+            "--under-contamination",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    runs = list_recovery_runs(parent_drift_run_id=parent)
+    assert len(runs) == 1
+    assert runs[0]["contamination_mode"] == "per_anchor_worst"
+
+    # At least one call must carry both feedback and the contamination
+    # suffix as system messages, in that order.
+    matching = [
+        c for c in fake.calls
+        if [m.content for m in c.messages if m.role == "system"]
+        == ["Defer.", expected_suffix]
+    ]
+    assert len(matching) == 1
+
+
+def test_apply_feedback_cli_contamination_stage_without_flag_rejected(
+    db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent, _ = _seed_drift_run_with_distinct_stages(anchor_id="A1")
+    fake = FakeLLMClient(responses=[])
+    monkeypatch.setattr(cli, "_backend_factory", lambda s: fake)
+    result = runner.invoke(
+        app,
+        [
+            "apply-feedback",
+            str(parent),
+            "--contamination-stage",
+            "concise",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "requires --under-contamination" in result.output
+
+
+def test_apply_feedback_cli_invalid_contamination_stage_rejected(
+    db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent, _ = _seed_drift_run_with_distinct_stages(anchor_id="A1")
+    fake = FakeLLMClient(responses=[])
+    monkeypatch.setattr(cli, "_backend_factory", lambda s: fake)
+    result = runner.invoke(
+        app,
+        [
+            "apply-feedback",
+            str(parent),
+            "--under-contamination",
+            "--contamination-stage",
+            "not_a_stage",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code != 0
+
+
+def test_recovery_report_includes_contamination_mode(db: str, policy: Policy) -> None:
+    """Issue #35: recovery-report exposes the mode for verdict interpretation."""
+    from maimonedes.monitor.recovery_report import build_report
+
+    parent, _ = _seed_drift_run_with_distinct_stages(anchor_id="A1")
+    anchors = [a for a in load_anchors(PROBES_PATH) if a.id == "A1"]
+    fake = FakeLLMClient(
+        responses=[
+            _feedback_response(),
+            _supervised_response(),
+            _compliant_judge(policy),
+        ]
+    )
+    run_id, _ = apply_feedback(
+        parent,
+        policy=policy,
+        anchors=anchors,
+        supervised_client=fake,
+        judge_client=fake,
+        supervised_model="m",
+        judge_model="j",
+        contrastive_kind="temporal",
+        top_k=1,
+        keep_contamination=True,
+        contamination_stage="concise",
+    )
+    report = build_report(run_id)
+    assert report.contamination_mode == "fixed_stage:concise"
+    assert report.contamination_stage_label == "concise"
+
+
+def test_alembic_round_trip_clean_drops_contamination_columns(db: str) -> None:
+    """0017 down→up restores the schema without losing other columns."""
+    from sqlalchemy import inspect
+
+    from maimonedes.storage.repo import get_engine
+
+    cfg = _alembic_cfg(db)
+    command.downgrade(cfg, "0016_perturbation_probes_synthesized_probe_id")
+    insp = inspect(get_engine())
+    cols = {c["name"] for c in insp.get_columns("recovery_runs")}
+    assert "contamination_mode" not in cols
+    assert "contamination_stage_label" not in cols
+    # Other columns survive.
+    assert "contrastive_kind" in cols
+    command.upgrade(cfg, "head")
+    cols = {c["name"] for c in inspect(get_engine()).get_columns("recovery_runs")}
+    assert "contamination_mode" in cols
+    assert "contamination_stage_label" in cols
+
+
 # ---- integration -----------------------------------------------------------
 
 

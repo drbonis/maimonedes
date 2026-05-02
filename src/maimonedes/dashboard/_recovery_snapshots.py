@@ -21,6 +21,8 @@ class RecoveryRunSnapshot:
     notes: str | None
     contrastive_kind: str
     label: str
+    contamination_mode: str = "clean"
+    contamination_stage_label: str | None = None
 
 
 @dataclass

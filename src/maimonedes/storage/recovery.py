@@ -49,6 +49,12 @@ class RecoveryRunRow(Base):
     judge_model: Mapped[str] = mapped_column(String(128), nullable=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     contrastive_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    contamination_mode: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="clean", server_default="clean"
+    )
+    contamination_stage_label: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
 
 
 class FeedbackRow(Base):
@@ -95,6 +101,8 @@ def _row_to_run(row: RecoveryRunRow) -> dict[str, object]:
         "judge_model": row.judge_model,
         "notes": row.notes,
         "contrastive_kind": row.contrastive_kind,
+        "contamination_mode": row.contamination_mode,
+        "contamination_stage_label": row.contamination_stage_label,
     }
 
 
@@ -121,6 +129,8 @@ def create_recovery_run(
     judge_model: str,
     contrastive_kind: ContrastiveKind,
     notes: str | None = None,
+    contamination_mode: str = "clean",
+    contamination_stage_label: str | None = None,
 ) -> int:
     """Create a recovery run row and return its id."""
     with get_session() as session:
@@ -130,6 +140,8 @@ def create_recovery_run(
             judge_model=judge_model,
             contrastive_kind=contrastive_kind,
             notes=notes,
+            contamination_mode=contamination_mode,
+            contamination_stage_label=contamination_stage_label,
         )
         session.add(row)
         session.flush()

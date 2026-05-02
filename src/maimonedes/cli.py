@@ -1737,14 +1737,39 @@ def apply_feedback_cmd(
         help="Print the affected anchors and the contrastive pair shapes "
         "without making any LLM calls.",
     ),
+    under_contamination: bool = typer.Option(
+        False,
+        "--under-contamination",
+        help="Re-evaluate anchors with the parent drift's contamination "
+        "suffix still active (issue #35). Default mode is per-anchor: "
+        "each anchor uses the suffix from its worst-aggregate session.",
+    ),
+    contamination_stage: str | None = typer.Option(
+        None,
+        "--contamination-stage",
+        help="Override per-anchor selection with a fixed stage label "
+        "applied uniformly across anchors. Requires --under-contamination.",
+    ),
 ) -> None:
     """Localize, synthesize feedback, and re-run anchors to close the loop."""
+    from maimonedes.core.drift import STAGE_LABELS
+
     if contrastive_kind not in ("temporal", "fragility"):
         raise typer.BadParameter(
             f"--kind must be 'temporal' or 'fragility', got {contrastive_kind!r}"
         )
     if top_k < 1:
         raise typer.BadParameter("--top-k must be >= 1")
+    if contamination_stage is not None:
+        if contamination_stage not in STAGE_LABELS:
+            raise typer.BadParameter(
+                f"--contamination-stage must be one of {list(STAGE_LABELS)}, "
+                f"got {contamination_stage!r}"
+            )
+        if not under_contamination:
+            raise typer.BadParameter(
+                "--contamination-stage requires --under-contamination"
+            )
 
     try:
         policy = load_policy(policy_path, rubric_path)
@@ -1830,6 +1855,8 @@ def apply_feedback_cmd(
             selected_anchor_ids=selected_ids,
             replay=replay,
             run_notes=notes,
+            keep_contamination=under_contamination,
+            contamination_stage=contamination_stage,  # type: ignore[arg-type]
             on_progress=_stream_recovery_progress,
         )
     except ValueError as exc:
@@ -1913,7 +1940,8 @@ def recovery_report_cmd(
     typer.echo(
         f"recovery_run_id={recovery_run_id} "
         f"parent_drift_run_id={report.parent_drift_run_id} "
-        f"contrastive_kind={report.contrastive_kind}"
+        f"contrastive_kind={report.contrastive_kind} "
+        f"contamination_mode={report.contamination_mode}"
     )
     for line in _format_recovery_table(report):
         typer.echo(line)

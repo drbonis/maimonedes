@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 
 from maimonedes.core.compliance import ComplianceScore
+from maimonedes.core.drift import STAGE_LABELS, StageLabel
 from maimonedes.core.feedback import ContrastiveKind, Feedback
 from maimonedes.core.policy import Policy
 from maimonedes.core.probe import AnchorProbe
@@ -30,7 +31,11 @@ from maimonedes.llm.recording_client import RecordingClient
 from maimonedes.monitor.localizer import LocalizationResult, localize
 from maimonedes.scorer.judge import Judge
 from maimonedes.storage.compliance import record_score
-from maimonedes.storage.drift import get_drift_run
+from maimonedes.storage.drift import (
+    DriftSessionRow,
+    get_drift_run,
+    list_drift_sessions,
+)
 from maimonedes.storage.perturbations import PerturbationProbeRow
 from maimonedes.storage.recovery import (
     create_recovery_run,
@@ -95,12 +100,42 @@ def apply_feedback(
     replay: bool = False,
     run_notes: str | None = None,
     supervised_temperature: float = 0.0,
+    keep_contamination: bool = False,
+    contamination_stage: StageLabel | None = None,
     on_progress: ProgressCallback | None = None,
 ) -> tuple[int, RecoveryRunSummary]:
-    """Run the Phase 4 closed-loop step on a parent drift run."""
+    """Run the Phase 4 closed-loop step on a parent drift run.
+
+    `keep_contamination=True` re-applies the parent drift's contamination
+    suffix as a SECOND system message during recovery evaluation, in
+    addition to the synthesized feedback. Two modes:
+
+    - `contamination_stage=None` (default when `keep_contamination=True`)
+      → per-anchor: each anchor gets the suffix from the session where
+      its worst aggregate occurred — the contamination level it actually
+      failed under.
+    - `contamination_stage="<label>"` → fixed-stage: every anchor gets
+      the same suffix from the named stage, useful for "test under the
+      worst stage we've ever seen" sweeps.
+
+    `keep_contamination=False` (default) preserves pre-#35 behaviour: only
+    the feedback is added as a system message.
+    """
     parent = get_drift_run(parent_drift_run_id)
     if parent is None:
         raise ValueError(f"drift_run {parent_drift_run_id} not found")
+
+    if contamination_stage is not None:
+        if contamination_stage not in STAGE_LABELS:
+            raise ValueError(
+                f"contamination_stage={contamination_stage!r} not in "
+                f"{STAGE_LABELS}"
+            )
+        if not keep_contamination:
+            raise ValueError(
+                "contamination_stage set but keep_contamination is False; "
+                "set keep_contamination=True to apply the suffix"
+            )
 
     localizations = localize(
         parent_drift_run_id,
@@ -114,6 +149,15 @@ def apply_feedback(
         raise ValueError(
             f"no affected anchors found in drift_run {parent_drift_run_id}"
         )
+
+    suffix_by_anchor, contamination_mode, contamination_stage_label = (
+        _resolve_contamination_suffixes(
+            parent_drift_run_id=parent_drift_run_id,
+            localizations=localizations,
+            keep_contamination=keep_contamination,
+            contamination_stage=contamination_stage,
+        )
+    )
 
     supervised_rc = RecordingClient(
         supervised_client, backend_name=SUPERVISED_BACKEND_NAME, replay=replay
@@ -135,6 +179,8 @@ def apply_feedback(
         judge_model=judge_model,
         contrastive_kind=contrastive_kind,
         notes=run_notes,
+        contamination_mode=contamination_mode,
+        contamination_stage_label=contamination_stage_label,
     )
 
     failure_count = 0
@@ -156,6 +202,7 @@ def apply_feedback(
                 contrastive_kind=contrastive_kind,
                 parent_drift_run_id=parent_drift_run_id,
                 recovery_run_id=recovery_run_id,
+                contamination_suffix=suffix_by_anchor.get(loc.anchor_id),
                 on_progress=on_progress,
             )
             failure_count += outcome.failure_count
@@ -174,6 +221,68 @@ def apply_feedback(
     return recovery_run_id, summary
 
 
+def _resolve_contamination_suffixes(
+    *,
+    parent_drift_run_id: int,
+    localizations: Sequence[LocalizationResult],
+    keep_contamination: bool,
+    contamination_stage: StageLabel | None,
+) -> tuple[dict[str, str], str, str | None]:
+    """Compute per-anchor contamination suffixes + the persisted mode label.
+
+    Returns `(suffix_by_anchor, contamination_mode, contamination_stage_label)`.
+
+    - `keep_contamination=False` → empty mapping, `mode="clean"`, label `None`.
+    - `keep_contamination=True` and `contamination_stage=None` →
+      per-anchor mapping keyed on each anchor's worst-aggregate session,
+      `mode="per_anchor_worst"`, label `None`.
+    - `keep_contamination=True` and `contamination_stage="<label>"` →
+      uniform mapping (every anchor gets the same suffix), mode
+      `"fixed_stage:<label>"`, label `<label>`.
+
+    A non-empty mapping omits anchors whose worst score has no
+    `drift_session_id` (e.g. when the localizer's worst falls outside
+    the drift run); those anchors evaluate without a suffix and the
+    caller logs the omission.
+    """
+    if not keep_contamination:
+        return {}, "clean", None
+
+    sessions = list_drift_sessions(parent_drift_run_id)
+    suffix_by_session_id: dict[int, str] = {s.id: s.suffix_text for s in sessions}
+
+    if contamination_stage is not None:
+        # Fixed-stage mode: pick the suffix from the first session at
+        # this stage. (Stages share a suffix in v1; if that ever
+        # changes per session, switch this to a join on the actual
+        # worst-session-of-this-stage.)
+        suffix = ""
+        for s in sessions:
+            if s.stage_label == contamination_stage:
+                suffix = s.suffix_text
+                break
+        suffix_by_anchor = {loc.anchor_id: suffix for loc in localizations}
+        return (
+            suffix_by_anchor,
+            f"fixed_stage:{contamination_stage}",
+            contamination_stage,
+        )
+
+    # Per-anchor-worst mode: each anchor gets the suffix from the
+    # drift session where its worst aggregate occurred.
+    suffix_by_anchor: dict[str, str] = {}
+    for loc in localizations:
+        sid = loc.worst_score.drift_session_id
+        if sid is None:
+            log.warning(
+                "apply_feedback.no_session_id_for_worst",
+                extra={"anchor_id": loc.anchor_id},
+            )
+            continue
+        suffix_by_anchor[loc.anchor_id] = suffix_by_session_id.get(sid, "")
+    return suffix_by_anchor, "per_anchor_worst", None
+
+
 def _run_one_anchor(
     *,
     loc: LocalizationResult,
@@ -187,6 +296,7 @@ def _run_one_anchor(
     contrastive_kind: ContrastiveKind,
     parent_drift_run_id: int,
     recovery_run_id: int,
+    contamination_suffix: str | None,
     on_progress: ProgressCallback | None,
 ) -> AnchorRecoveryOutcome:
     anchor_id = loc.anchor_id
@@ -281,6 +391,7 @@ def _run_one_anchor(
             anchor=anchor,
             policy=policy,
             feedback_text=synthesized.text,
+            contamination_suffix=contamination_suffix,
             supervised_rc=supervised_rc,
             judge=judge,
             supervised_model=supervised_model,
@@ -312,6 +423,7 @@ def _run_one_anchor(
             anchor=anchor,
             policy=policy,
             feedback_text=synthesized.text,
+            contamination_suffix=contamination_suffix,
             supervised_rc=supervised_rc,
             judge=judge,
             supervised_model=supervised_model,
@@ -338,6 +450,7 @@ def _evaluate_with_feedback(
     anchor: AnchorProbe,
     policy: Policy,
     feedback_text: str,
+    contamination_suffix: str | None,
     supervised_rc: RecordingClient,
     judge: Judge,
     supervised_model: str,
@@ -346,10 +459,16 @@ def _evaluate_with_feedback(
     probe_role: str,
     perturbation_id: int | None,
 ) -> ComplianceScore:
-    messages = [
+    # Feedback first, contamination suffix second — the operator's
+    # corrective instruction is the conservative ordering. An empty
+    # suffix in per-anchor mode is treated as "no suffix"; this can
+    # happen for the baseline stage's empty suffix_text.
+    messages: list[Message] = [
         Message(role="system", content=feedback_text),
-        Message(role="user", content=scenario),
     ]
+    if contamination_suffix:
+        messages.append(Message(role="system", content=contamination_suffix))
+    messages.append(Message(role="user", content=scenario))
     supervised_resp = supervised_rc.chat_completion(
         messages,
         model=supervised_model,
@@ -376,6 +495,7 @@ def _rerun_perturbations(
     anchor: AnchorProbe,
     policy: Policy,
     feedback_text: str,
+    contamination_suffix: str | None,
     supervised_rc: RecordingClient,
     judge: Judge,
     supervised_model: str,
@@ -412,6 +532,7 @@ def _rerun_perturbations(
                 anchor=anchor,
                 policy=policy,
                 feedback_text=feedback_text,
+                contamination_suffix=contamination_suffix,
                 supervised_rc=supervised_rc,
                 judge=judge,
                 supervised_model=supervised_model,

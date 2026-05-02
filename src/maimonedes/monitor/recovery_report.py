@@ -60,6 +60,8 @@ class RecoveryReport:
     mean_delta_toward_baseline: float | None
     recovered_count: int
     verdict: RecoveryVerdict
+    contamination_mode: str = "clean"
+    contamination_stage_label: str | None = None
 
     @property
     def total_anchors(self) -> int:
@@ -161,6 +163,12 @@ def build_report(recovery_run_id: int) -> RecoveryReport:
     else:
         verdict = "failed"
 
+    contamination_mode = str(run.get("contamination_mode") or "clean")
+    raw_stage_label = run.get("contamination_stage_label")
+    contamination_stage_label = (
+        str(raw_stage_label) if raw_stage_label else None
+    )
+
     return RecoveryReport(
         rows=rows,
         parent_drift_run_id=parent_drift_run_id,
@@ -168,6 +176,8 @@ def build_report(recovery_run_id: int) -> RecoveryReport:
         mean_delta_toward_baseline=mean_delta,
         recovered_count=recovered_count,
         verdict=verdict,
+        contamination_mode=contamination_mode,
+        contamination_stage_label=contamination_stage_label,
     )
 
 
