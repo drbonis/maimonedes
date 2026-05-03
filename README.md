@@ -107,9 +107,20 @@ uv run maimonedes apply-feedback <DRIFT_ID> --under-contamination --contaminatio
 Once you have ≥50 (text, score) pairs in `compliance_scores`:
 
 ```bash
-uv run maimonedes train-stage2 --head-kind ridge                     # or --head-kind mlp
-uv run maimonedes score-stage2 "<some text>"                         # cheap online scoring
-uv run maimonedes audit-stage2                                       # hybrid trigger: when to fall back to LLM judge
+uv run maimonedes train-stage2 --head-kind ridge                     # or --head-kind mlp, returns a STAGE2_ID
+# Now run the scoring for all anchors but using stage2 model (instead of LLM)
+uv run maimonedes score-stage2 A1 --model <STAGE2_ID> --persist
+uv run maimonedes score-stage2 A2 --model <STAGE2_ID> --persist
+uv run maimonedes score-stage2 A3 --model <STAGE2_ID> --persist
+uv run maimonedes score-stage2 A4 --model <STAGE2_ID> --persist
+uv run maimonedes score-stage2 A5 --model <STAGE2_ID> --persist
+uv run maimonedes score-stage2 A6 --model <STAGE2_ID> --persist
+uv run maimonedes score-stage2 A7 --model <STAGE2_ID> --persist
+uv run maimonedes score-stage2 A8 --model <STAGE2_ID> --persist
+
+uv run maimonedes score-stage2 A3 --text "<some output>"             # cheap online scoring (A3 = anchor id)
+uv run maimonedes audit-stage2 <STAGE2_ID>                           # gated audit: re-route recent Stage-2 scores through the LLM judge
+uv run maimonedes audit-stage2 <STAGE2_ID> --force                   # bypass the n-scores/hours trigger gate
 
 uv run maimonedes fit-gp                                             # GP over (embedding, aggregate)
 uv run maimonedes fit-gp --kernel non_stationary --diagnose          # #49 — Gibbs kernel + per-PCA-1-quartile diagnostic

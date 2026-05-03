@@ -342,7 +342,12 @@ def _score_synthesized(
     )
 
     if scorer == "judge":
-        score = judge.score(policy, anchor, supervised_response.content)
+        score = judge.score(
+            policy,
+            anchor,
+            supervised_response.content,
+            llm_call_id=supervised_response.llm_call_id,
+        )
     else:
         assert stage2_model is not None  # validated by caller
         s2 = Stage2Scorer(stage2_model, embed_client, policy)
@@ -350,6 +355,7 @@ def _score_synthesized(
             anchor,
             supervised_response.content,
             supervised_model=supervised_model,
+            llm_call_id=supervised_response.llm_call_id,
         )
     score = score.model_copy(
         update={

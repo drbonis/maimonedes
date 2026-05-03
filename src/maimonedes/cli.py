@@ -445,6 +445,7 @@ def score_stage2_cmd(
     scorer = Stage2Scorer(stage2, rc, policy, model_path=model_row.path)
     anchor = get_anchor_by_id(list(anchors), anchor_id)
 
+    supervised_call_id: int | None = None
     if text is None:
         backend = _backend_factory(settings)
         supervised_rc = RecordingClient(
@@ -462,9 +463,13 @@ def score_stage2_cmd(
             typer.echo(f"supervised LLM error: {exc}", err=True)
             raise typer.Exit(code=2) from exc
         text = response.content
+        supervised_call_id = response.llm_call_id
 
     score = scorer.score(
-        anchor, text, supervised_model=settings.ollama_supervised_model
+        anchor,
+        text,
+        supervised_model=settings.ollama_supervised_model,
+        llm_call_id=supervised_call_id,
     )
     if persist:
         record_score(score)

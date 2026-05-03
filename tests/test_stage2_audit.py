@@ -183,6 +183,24 @@ def test_stage2_scorer_rejects_policy_mismatch(
         scorer.score(bogus_anchor, "text")
 
 
+def test_stage2_scorer_threads_llm_call_id_into_score(
+    db: str, policy: Policy, anchors: list[AnchorProbe]
+) -> None:
+    """Issue: audit-stage2 needs the supervised FK to recover source text.
+    Stage2Scorer.score(llm_call_id=N) must persist on the returned row."""
+    _seed_training_pairs(policy)
+    model = _make_stage2_model(policy)
+    fake_embed = FakeEmbedClient(default_dim=16)
+    scorer = Stage2Scorer(model, fake_embed, policy)
+
+    a1 = next(a for a in anchors if a.id == "A1")
+    score_with = scorer.score(a1, "text", llm_call_id=42)
+    assert score_with.llm_call_id == 42
+    # Default (no kwarg) keeps the legacy NULL behaviour for backward compat.
+    score_without = scorer.score(a1, "text")
+    assert score_without.llm_call_id is None
+
+
 # ---- audit detector --------------------------------------------------------
 
 
@@ -520,3 +538,141 @@ def test_score_stage2_cli_with_text_override(
     assert result.exit_code == 0, result.output
     assert "anchor=A1" in result.output
     assert "stage2:" in result.output
+
+
+def test_score_stage2_cli_live_supervised_persists_llm_call_id(
+    db: str,
+    policy: Policy,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Without --text, the CLI runs a live supervised call and must
+    thread its llm_call_id onto the persisted Stage-2 score row so
+    audit-stage2 can later recover the supervised text."""
+    from maimonedes.storage.compliance import ComplianceScoreRow
+    from maimonedes.storage.llm_calls import LLMCall
+    from maimonedes.storage.repo import get_session
+
+    _seed_training_pairs(policy)
+    stage2_model = _make_stage2_model(policy)
+    model_path = tmp_path / "stage2_live.pkl"
+    stage2_model.save(model_path)
+    model_row_id = record_stage2_model(
+        path=str(model_path),
+        policy_id=policy.id,
+        n_samples=stage2_model.n_samples,
+        embedding_model=stage2_model.embedding_model,
+        mae_per_axis={m.sub_id: m.mae for m in stage2_model.agreement_metrics},
+        spearman_per_axis={
+            m.sub_id: m.spearman_rho for m in stage2_model.agreement_metrics
+        },
+        agreement_status=stage2_model.agreement_status,
+    )
+    fake_embed = FakeEmbedClient(default_dim=16)
+    fake_supervised = FakeLLMClient(
+        responses=[
+            ChatResponse(
+                content="Discuss with your physician.",
+                model="llama:test",
+                latency_ms=1.0,
+            )
+        ]
+    )
+    monkeypatch.setattr(cli, "_embed_factory", lambda s: fake_embed)
+    monkeypatch.setattr(cli, "_backend_factory", lambda s: fake_supervised)
+
+    result = runner.invoke(
+        app,
+        [
+            "score-stage2",
+            "A1",
+            "--model",
+            str(model_row_id),
+            "--persist",
+            "--policy",
+            str(POLICY_PATH),
+            "--rubric",
+            str(RUBRIC_PATH),
+            "--probes",
+            str(PROBES_PATH),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    with get_session() as session:
+        rows = (
+            session.query(ComplianceScoreRow)
+            .filter(ComplianceScoreRow.judge_model.like("stage2:%"))
+            .all()
+        )
+        sup_ids = {
+            r.id
+            for r in session.query(LLMCall)
+            .filter(LLMCall.backend_name == "ollama-supervised")
+            .all()
+        }
+        fk_pairs = [(r.id, r.llm_call_id) for r in rows]
+    assert len(fk_pairs) == 1
+    score_id, fk = fk_pairs[0]
+    assert fk is not None, f"Stage-2 score {score_id} has no llm_call_id FK"
+    assert fk in sup_ids, f"FK {fk} is not a supervised LLMCall id"
+
+
+def test_score_stage2_cli_text_override_leaves_llm_call_id_null(
+    db: str,
+    policy: Policy,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """--text bypasses the supervised call → no LLMCall to FK to → NULL.
+    This is correct: the audit fundamentally needs a recoverable supervised
+    text; text-override rows aren't auditable."""
+    from maimonedes.storage.compliance import ComplianceScoreRow
+    from maimonedes.storage.repo import get_session
+
+    _seed_training_pairs(policy)
+    stage2_model = _make_stage2_model(policy)
+    model_path = tmp_path / "stage2_txt.pkl"
+    stage2_model.save(model_path)
+    model_row_id = record_stage2_model(
+        path=str(model_path),
+        policy_id=policy.id,
+        n_samples=stage2_model.n_samples,
+        embedding_model=stage2_model.embedding_model,
+        mae_per_axis={m.sub_id: m.mae for m in stage2_model.agreement_metrics},
+        spearman_per_axis={
+            m.sub_id: m.spearman_rho for m in stage2_model.agreement_metrics
+        },
+        agreement_status=stage2_model.agreement_status,
+    )
+    fake_embed = FakeEmbedClient(default_dim=16)
+    monkeypatch.setattr(cli, "_embed_factory", lambda s: fake_embed)
+
+    result = runner.invoke(
+        app,
+        [
+            "score-stage2",
+            "A1",
+            "--model",
+            str(model_row_id),
+            "--text",
+            "supplied text",
+            "--persist",
+            "--policy",
+            str(POLICY_PATH),
+            "--rubric",
+            str(RUBRIC_PATH),
+            "--probes",
+            str(PROBES_PATH),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    with get_session() as session:
+        rows = (
+            session.query(ComplianceScoreRow)
+            .filter(ComplianceScoreRow.judge_model.like("stage2:%"))
+            .all()
+        )
+        fk_pairs = [(r.id, r.llm_call_id) for r in rows]
+    assert len(fk_pairs) == 1
+    assert fk_pairs[0][1] is None

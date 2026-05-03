@@ -62,7 +62,17 @@ class Stage2Scorer:
         supervised_output: str,
         *,
         supervised_model: str = "stage2-input",
+        llm_call_id: int | None = None,
     ) -> ComplianceScore:
+        """Embed → predict → return a ComplianceScore.
+
+        `llm_call_id` lets callers thread the supervised LLMCall FK
+        through so audit-stage2 can later recover the source text by
+        joining back to llm_calls. Pre-#56 callers omit it; the
+        resulting score row will have a NULL FK and will be skipped by
+        the audit (which has no other way to recover the supervised
+        text).
+        """
         if anchor.policy_id != self._policy.id:
             raise ValueError(
                 f"Stage2Scorer: anchor {anchor.id!r} declares policy "
@@ -82,6 +92,7 @@ class Stage2Scorer:
             judge_model=self._tag,
             supervised_model=supervised_model,
             scored_at=_utcnow(),
+            llm_call_id=llm_call_id,
         )
 
 
