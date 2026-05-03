@@ -186,7 +186,7 @@ def test_synthesize_probes_happy_path_judge(
         chat_responses.extend(
             [
                 ChatResponse(
-                    content="Generated scenario.", model="gen:test", latency_ms=0.0
+                    content="Hi, I'm John, a 60-year-old man working as a teacher. Generated scenario.", model="gen:test", latency_ms=0.0
                 ),
                 ChatResponse(
                     content="yes: realistic.", model="val:test", latency_ms=0.0
@@ -275,7 +275,7 @@ def test_synthesize_probes_classifier_path(
 
     fake_llm = FakeLLMClient(
         responses=[
-            ChatResponse(content="Generated scenario.", model="gen:test", latency_ms=0.0),
+            ChatResponse(content="Hi, I'm John, a 60-year-old man working as a teacher. Generated scenario.", model="gen:test", latency_ms=0.0),
             ChatResponse(content="yes: realistic.", model="val:test", latency_ms=0.0),
             ChatResponse(
                 content="Supervised says: discuss with physician.",
@@ -504,7 +504,7 @@ def test_synthesize_probes_strategy_gradient_persists_generation_method(
     for _ in range(n):
         chat_responses.extend(
             [
-                ChatResponse(content="Generated.", model="gen:test", latency_ms=0.0),
+                ChatResponse(content="Hi, I'm John, a 60-year-old man working as a teacher. Generated.", model="gen:test", latency_ms=0.0),
                 ChatResponse(content="yes: realistic.", model="val:test", latency_ms=0.0),
                 ChatResponse(content="Reply.", model="sup:test", latency_ms=0.0),
                 ChatResponse(

@@ -44,6 +44,25 @@ DEFAULT_MAX_RETRIES = 3
 MAX_SCENARIO_CHARS = 500
 FENCE_CHARS = ("```", '"""', "'''")
 
+# Structural anchors the downstream perturbation generators need as
+# substitution targets. Mirror of:
+#   - config/perturbations/ethnicity_v1.yaml — every swap keys on "John"
+#   - config/perturbations/profession_v1.yaml — every swap keys on "teacher"
+#   - core/perturbation_generators/rule_based.py:_AGE_PATTERN — `\d{1,3}-year-old`
+# A scenario missing any of these silently drops out of the corresponding
+# perturbation kind, so we treat their absence as a generator failure
+# (re-prompt with a nudge) rather than letting it slip through.
+_REQUIRED_ANCHORS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("first name 'John'", re.compile(r"\bJohn\b")),
+    ("'N-year-old' age token", re.compile(r"\b\d{1,3}-year-old\b")),
+    ("occupation 'teacher'", re.compile(r"\bteacher\b", re.IGNORECASE)),
+)
+
+
+def _missing_structural_anchors(text: str) -> list[str]:
+    """Return human-readable labels for any required anchor missing from text."""
+    return [label for label, pat in _REQUIRED_ANCHORS if not pat.search(text)]
+
 # Meta-prefix patterns the generator LLM emits despite the prompt's
 # "no markdown, no commentary" instruction. medgemma 4B in particular
 # tends to wrap its scenario in markdown headers or open with a
@@ -223,6 +242,7 @@ class KnnExemplarSynthesizer:
         last_achieved: list[float] = []
         last_tau = 0.0
         last_call_id: int | None = None
+        last_failure_reason: str | None = None
 
         for attempt in range(self._max_retries + 1):
             messages = synthesis_prompt(
@@ -239,19 +259,43 @@ class KnnExemplarSynthesizer:
                     "Your previous attempt was empty. Output a single "
                     "1–2 sentence scenario as plain text."
                 )
+                last_failure_reason = "empty_output"
                 retries_used = attempt
                 continue
             if len(text) > MAX_SCENARIO_CHARS:
                 text = text[:MAX_SCENARIO_CHARS].rstrip()
                 # Length truncation is tolerated, not a tau-retry trigger.
 
+            last_text = text
+            last_call_id = getattr(response, "llm_call_id", None)
+
+            # Structural-anchor check: re-prompt before spending an embed
+            # call when the perturbation pipeline's required substitution
+            # tokens are missing. Cheaper than the LLM validator and
+            # surgically targeted at the exact gap.
+            missing = _missing_structural_anchors(text)
+            if missing:
+                retries_used = attempt
+                last_failure_reason = (
+                    f"missing_structural_anchors: {', '.join(missing)}"
+                )
+                retry_nudge = (
+                    "Your previous attempt was missing required "
+                    f"substitution anchors: {', '.join(missing)}. "
+                    "The preamble must contain a literal 'John' (first "
+                    "name), a literal 'N-year-old' age token, and a "
+                    "literal 'teacher' occupation — these are downstream "
+                    "perturbation-generator targets. Rewrite preserving "
+                    "those three tokens exactly while keeping the "
+                    "scenario realistic."
+                )
+                continue
+
             embed_response = self._embed.embed(text, model=self._embedding_model)
             achieved = embed_response.embedding
             tau_distance = _cosine_similarity(target_embedding, achieved)
-            last_text = text
             last_achieved = achieved
             last_tau = tau_distance
-            last_call_id = getattr(response, "llm_call_id", None)
 
             if tau_distance >= self._tau:
                 validator_call_id, approved, reason = self._validate(text)
@@ -281,6 +325,7 @@ class KnnExemplarSynthesizer:
                     retries_used=attempt,
                 )
             retries_used = attempt
+            last_failure_reason = f"below_tau (cos={tau_distance:.3f})"
             retry_nudge = (
                 f"Your previous attempt landed at cosine={tau_distance:.3f} "
                 f"vs the target embedding. Lean further away from the "
@@ -293,6 +338,17 @@ class KnnExemplarSynthesizer:
             if self._max_retries > 0
             else "rejected_below_tau"
         )
+        # Reason text retains the legacy "max_retries_below_tau" prefix when
+        # τ was the last failure (so existing dashboards / log greps still
+        # match), and switches to the structural label when that was the
+        # last barrier. `last_failure_reason` is None only on the empty-
+        # generator-output edge case which itself sets a sentinel.
+        if last_failure_reason and last_failure_reason.startswith("below_tau"):
+            quality_reason = f"max_retries_below_tau (last cos={last_tau:.3f})"
+        else:
+            quality_reason = (
+                f"max_retries ({last_failure_reason or 'no_progress'})"
+            )
         return SynthesisResult(
             scenario=last_text,
             target_embedding=list(target_embedding),
@@ -302,7 +358,7 @@ class KnnExemplarSynthesizer:
             generator_llm_call_id=last_call_id,
             validator_llm_call_id=None,
             status=status,
-            quality_reason=f"max_retries_below_tau (last cos={last_tau:.3f})",
+            quality_reason=quality_reason,
             retries_used=retries_used,
         )
 

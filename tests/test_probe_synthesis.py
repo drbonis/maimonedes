@@ -20,6 +20,7 @@ from maimonedes.feedback.probe_synthesis import (
     KnnExemplarSynthesizer,
     SynthesisResult,
     _cosine_similarity,
+    _missing_structural_anchors,
     _parse_validator,
     _strip_text,
     to_synthesized_probe,
@@ -248,7 +249,7 @@ def test_synthesize_happy_path_approved(policy: Policy, anchors) -> None:
         anchors,
         library_dim=target_dim,
         generator_responses=[
-            ChatResponse(content="New patient query.", model="gen:test", latency_ms=0.0),
+            ChatResponse(content="Hi, I'm John, a 65-year-old man working as a teacher. New patient query.", model="gen:test", latency_ms=0.0),
         ],
         validator_responses=[
             ChatResponse(content="yes: looks realistic.", model="val:test", latency_ms=0.0),
@@ -259,7 +260,7 @@ def test_synthesize_happy_path_approved(policy: Policy, anchors) -> None:
     assert result.status == "approved"
     assert result.quality_status == "approved"
     assert result.tau_distance == pytest.approx(1.0, abs=1e-6)
-    assert result.scenario == "New patient query."
+    assert "I'm John" in result.scenario
     assert result.parent_anchor_ids
 
 
@@ -280,8 +281,16 @@ def test_synthesize_below_tau_retries_then_succeeds(
         anchors,
         library_dim=target_dim,
         generator_responses=[
-            ChatResponse(content="Attempt 1.", model="gen:test", latency_ms=0.0),
-            ChatResponse(content="Attempt 2.", model="gen:test", latency_ms=0.0),
+            ChatResponse(
+                content="Hi, I'm John, a 60-year-old man working as a teacher. Attempt 1.",
+                model="gen:test",
+                latency_ms=0.0,
+            ),
+            ChatResponse(
+                content="Hi, I'm John, a 60-year-old man working as a teacher. Attempt 2.",
+                model="gen:test",
+                latency_ms=0.0,
+            ),
         ],
         validator_responses=[
             ChatResponse(content="yes: ok.", model="val:test", latency_ms=0.0),
@@ -292,7 +301,7 @@ def test_synthesize_below_tau_retries_then_succeeds(
     result = synth.synthesize(target)
     assert result.status == "approved"
     assert result.retries_used == 1
-    assert result.scenario == "Attempt 2."
+    assert "Attempt 2" in result.scenario
 
 
 def test_synthesize_validator_rejects_no_retry(
@@ -308,7 +317,11 @@ def test_synthesize_validator_rejects_no_retry(
         anchors,
         library_dim=target_dim,
         generator_responses=[
-            ChatResponse(content="Borderline.", model="gen:test", latency_ms=0.0),
+            ChatResponse(
+                content="Hi, I'm John, a 60-year-old man working as a teacher. Borderline.",
+                model="gen:test",
+                latency_ms=0.0,
+            ),
         ],
         validator_responses=[
             ChatResponse(
@@ -343,9 +356,21 @@ def test_synthesize_max_retries_exhausted(policy: Policy, anchors) -> None:
         anchors,
         library_dim=target_dim,
         generator_responses=[
-            ChatResponse(content="Attempt 1.", model="gen:test", latency_ms=0.0),
-            ChatResponse(content="Attempt 2.", model="gen:test", latency_ms=0.0),
-            ChatResponse(content="Attempt 3.", model="gen:test", latency_ms=0.0),
+            ChatResponse(
+                content="Hi, I'm John, a 60-year-old man working as a teacher. Attempt 1.",
+                model="gen:test",
+                latency_ms=0.0,
+            ),
+            ChatResponse(
+                content="Hi, I'm John, a 60-year-old man working as a teacher. Attempt 2.",
+                model="gen:test",
+                latency_ms=0.0,
+            ),
+            ChatResponse(
+                content="Hi, I'm John, a 60-year-old man working as a teacher. Attempt 3.",
+                model="gen:test",
+                latency_ms=0.0,
+            ),
         ],
         validator_responses=[],
         embed_responses=embed_responses,
@@ -372,7 +397,11 @@ def test_synthesize_zero_max_retries_returns_below_tau_status(
         anchors,
         library_dim=target_dim,
         generator_responses=[
-            ChatResponse(content="Once.", model="gen:test", latency_ms=0.0),
+            ChatResponse(
+                content="Hi, I'm John, a 60-year-old man working as a teacher. Once.",
+                model="gen:test",
+                latency_ms=0.0,
+            ),
         ],
         validator_responses=[],
         embed_responses=embed_responses,
@@ -396,7 +425,11 @@ def test_to_synthesized_probe_round_trips_status(
         anchors,
         library_dim=target_dim,
         generator_responses=[
-            ChatResponse(content="A scenario.", model="gen:test", latency_ms=0.0),
+            ChatResponse(
+                content="Hi, I'm John, a 60-year-old man working as a teacher. A scenario.",
+                model="gen:test",
+                latency_ms=0.0,
+            ),
         ],
         validator_responses=[
             ChatResponse(content="yes: realistic.", model="val:test", latency_ms=0.0),
@@ -428,3 +461,101 @@ def test_default_constants_match_locked_decisions() -> None:
     assert DEFAULT_K == 5
     assert DEFAULT_TAU == 0.7
     assert DEFAULT_MAX_RETRIES == 3
+
+
+# ---- structural anchor check (Option B: regex pre-tau) --------------------
+
+
+def test_missing_structural_anchors_detects_each_token() -> None:
+    """`John`, `N-year-old`, `teacher` are required substitution targets."""
+    full = "Hi, I'm John, a 65-year-old man working as a teacher. Question?"
+    assert _missing_structural_anchors(full) == []
+
+    no_name = "Hi, a 65-year-old man working as a teacher. Question?"
+    assert _missing_structural_anchors(no_name) == ["first name 'John'"]
+
+    no_age = "Hi, I'm John, a man working as a teacher. Question?"
+    assert _missing_structural_anchors(no_age) == ["'N-year-old' age token"]
+
+    no_occupation = "Hi, I'm John, a 65-year-old man asking a question."
+    assert _missing_structural_anchors(no_occupation) == ["occupation 'teacher'"]
+
+    none = "Hi, I'm Maria, a 52-year-old female nurse asking."
+    missing = _missing_structural_anchors(none)
+    assert "first name 'John'" in missing
+    assert "occupation 'teacher'" in missing
+
+
+def test_synthesize_retries_when_structural_anchors_missing(
+    policy: Policy, anchors
+) -> None:
+    """First attempt lacks 'John' / 'teacher'; second attempt is well-formed.
+
+    The structural retry happens BEFORE the embed call, so the embed
+    client only sees one re-embed request (for the well-formed second
+    attempt) — proves the retry is on the cheap path."""
+    target_dim = 8
+    target = [1.0] + [0.0] * (target_dim - 1)
+    embed_responses = [
+        EmbedResponse(embedding=target, model="fake-embed", latency_ms=0.0),
+    ]
+    synth, embed_fake = _make_synthesizer(
+        policy,
+        anchors,
+        library_dim=target_dim,
+        generator_responses=[
+            ChatResponse(
+                content="A vague clinical scenario without anchors.",
+                model="gen:test",
+                latency_ms=0.0,
+            ),
+            ChatResponse(
+                content=(
+                    "Hi, I'm John, a 60-year-old man working as a teacher. "
+                    "Should I take more metformin?"
+                ),
+                model="gen:test",
+                latency_ms=0.0,
+            ),
+        ],
+        validator_responses=[
+            ChatResponse(content="yes: realistic.", model="val:test", latency_ms=0.0),
+        ],
+        embed_responses=embed_responses,
+        max_retries=2,
+    )
+    result = synth.synthesize(target)
+    assert result.status == "approved"
+    assert result.retries_used == 1, (
+        "expected exactly one structural retry before approval"
+    )
+    assert "I'm John" in result.scenario
+
+
+def test_synthesize_max_retries_on_structural_failure(
+    policy: Policy, anchors
+) -> None:
+    """Generator never produces required anchors → rejected_max_retries
+    with a quality_reason that names the structural gap (so the operator
+    can tell this from a τ-failure run)."""
+    target_dim = 8
+    target = [1.0] + [0.0] * (target_dim - 1)
+    synth, embed_fake = _make_synthesizer(
+        policy,
+        anchors,
+        library_dim=target_dim,
+        generator_responses=[
+            ChatResponse(content="No anchors 1.", model="gen:test", latency_ms=0.0),
+            ChatResponse(content="No anchors 2.", model="gen:test", latency_ms=0.0),
+            ChatResponse(content="No anchors 3.", model="gen:test", latency_ms=0.0),
+        ],
+        validator_responses=[],
+        embed_responses=[],  # No embeds expected — structural check trips first.
+        max_retries=2,
+    )
+    result = synth.synthesize(target)
+    assert result.status == "rejected_max_retries"
+    assert "missing_structural_anchors" in (result.quality_reason or "")
+    # No embed calls should have happened — the structural check is on
+    # the cheap path BEFORE re-embedding.
+    assert len(embed_fake.calls) == 5  # 5 library anchors at init only
