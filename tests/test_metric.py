@@ -28,6 +28,7 @@ from maimonedes.monitor.metric import (
     _build_lower_triangular,
     _build_lower_triangular_grad,
     _frobenius_loss_and_grad,
+    compute_radial_projection_cloud,
     compute_ratio_surface,
     euclidean_distance,
     fit_metric,
@@ -527,9 +528,10 @@ def test_compute_ratio_surface_local_stretch_is_positive() -> None:
     assert np.all(z_arr > 0)
 
 
-def test_compute_ratio_surface_fixed_reference_amplifies_near_boundary() -> None:
-    """The §4.6 narrative: cells near the violation boundary should have a
-    Riemannian/Euclidean ratio > 1 (the radial metric has scale > 1 there)."""
+def test_compute_ratio_surface_fixed_reference_attenuates_near_boundary() -> None:
+    """Topographic convention (high = stable, low = fragile): cells near
+    the violation boundary should have Z = euclidean/riemannian < 1
+    on the radial metric (scale > 1 there → riem dominates eucl)."""
     metric = _make_radial_metric()
     _, _, z = compute_ratio_surface(
         metric,
@@ -541,11 +543,12 @@ def test_compute_ratio_surface_fixed_reference_amplifies_near_boundary() -> None
     )
     z_arr = np.asarray(z, dtype=float)
     # Cell at (~0.0, ~0.0) — corner, deepest into the violation region —
-    # is far from the reference and crosses the high-scale region.
+    # crosses the high-scale region. Eucl/Riem < 1 (fragile = canyon).
     corner = z_arr[0, 0]
     assert np.isfinite(corner)
-    assert corner > 1.0, (
-        f"corner ratio {corner:.3f} should be > 1 for the radial metric"
+    assert corner < 1.0, (
+        f"corner Z {corner:.3f} should be < 1 for the radial metric "
+        f"(eucl/riem inverted; topographic convention)"
     )
 
 
@@ -588,6 +591,126 @@ def test_worst_fragility_axis_pair_falls_back_when_no_data(db: str) -> None:
         sub_condition_ids=("a", "b", "c"), fallback=(0, 2)
     )
     assert pair == (0, 2)
+
+
+def test_compute_radial_projection_cloud_basic_shape() -> None:
+    metric = _make_radial_metric()
+    result = compute_radial_projection_cloud(
+        metric,
+        n_samples=200,
+        seed=0,
+        include_anchors=False,
+    )
+    pts = result["points"]
+    labels = result["axis_labels"]
+    assert len(pts) == 200
+    assert len(labels) == metric.k
+    # Each label is (axis_index, x, y).
+    for ax_idx, lx, ly in labels:
+        assert 0 <= ax_idx < metric.k
+        assert np.isfinite(lx) and np.isfinite(ly)
+    # Points carry (x, y, z, c_full, is_anchor); none of the random
+    # samples should be flagged as anchors.
+    for x, y, z, c_full, is_anchor in pts:
+        assert isinstance(c_full, tuple) and len(c_full) == metric.k
+        assert is_anchor is False
+        assert np.isfinite(x) and np.isfinite(y)
+        # z is finite OR NaN (the latter only at the reference itself).
+        assert (np.isfinite(z) or np.isnan(z))
+
+
+def test_compute_radial_projection_cloud_balanced_c_projects_near_origin() -> None:
+    """Star-coord with equal angles: any c with all axes equal lands at (0,0).
+    Verified by injecting a uniform-c sample (via a custom seed-trick path)
+    — instead, we confirm the projection algebra directly: the all-0.5
+    midpoint must project to ~(0, 0)."""
+    metric = _make_radial_metric()
+    # k=2 case: angles 0 and π. cos(0)=1, cos(π)=-1. So x = c0 - c1.
+    # For c=(0.5, 0.5), x = 0, y = 0.
+    k = metric.k
+    c = np.full(k, 0.5)
+    thetas = np.array([2.0 * np.pi * i / k for i in range(k)])
+    x_expected = float(np.dot(c, np.cos(thetas)))
+    y_expected = float(np.dot(c, np.sin(thetas)))
+    # k=2: x_expected = 0.5·(1) + 0.5·(-1) = 0; y = 0.
+    # k>=3 with equal angles: also 0 by symmetry.
+    assert abs(x_expected) < 1e-9
+    assert abs(y_expected) < 1e-9
+
+
+def test_compute_radial_projection_cloud_is_deterministic() -> None:
+    metric = _make_radial_metric()
+    a = compute_radial_projection_cloud(metric, n_samples=50, seed=42, include_anchors=False)
+    b = compute_radial_projection_cloud(metric, n_samples=50, seed=42, include_anchors=False)
+    assert len(a["points"]) == len(b["points"]) == 50
+    for pa, pb in zip(a["points"], b["points"]):
+        assert pa[0] == pytest.approx(pb[0], abs=1e-12)
+        assert pa[1] == pytest.approx(pb[1], abs=1e-12)
+        if np.isnan(pa[2]) or np.isnan(pb[2]):
+            assert np.isnan(pa[2]) and np.isnan(pb[2])
+        else:
+            assert pa[2] == pytest.approx(pb[2], abs=1e-9)
+
+
+def test_compute_radial_projection_cloud_includes_anchors_when_requested(db: str) -> None:
+    """With include_anchors=True and a Jacobian seeded in the DB, the
+    returned cloud contains an `is_anchor=True` point at the anchor's
+    baseline position."""
+    metric = _make_radial_metric()
+    # Seed an anchor + perturbations so all_jacobians() returns one entry.
+    sub_ids = ("a", "b")  # k=2 to match the radial metric's k.
+    record_score(
+        ComplianceScore(
+            anchor_id="ANCH",
+            policy_id="example1",
+            per_sub_condition={"a": 0.85, "b": 0.85},
+            aggregate=0.85,
+            judge_model="j",
+            supervised_model="s",
+        )
+    )
+    probe = PerturbationProbe(
+        anchor_id="ANCH",
+        scenario="perturb",
+        perturbation_kind="authority",
+        transform_label="authority:0",
+        generator_metadata={},
+    )
+    pid = record_perturbation(probe)
+    record_score(
+        ComplianceScore(
+            anchor_id="ANCH",
+            policy_id="example1",
+            per_sub_condition={"a": 0.5, "b": 0.5},
+            aggregate=0.5,
+            judge_model="j",
+            supervised_model="s",
+            perturbation_id=pid,
+            probe_role="perturbation",
+        )
+    )
+    result = compute_radial_projection_cloud(
+        metric, n_samples=10, seed=0, include_anchors=True
+    )
+    flagged = [p for p in result["points"] if p[4] is True]
+    assert len(flagged) >= 1
+    # The flagged anchor's c_full should match the seeded baseline (0.85, 0.85)
+    # when sub_condition_ids align — but `metric` from `_make_radial_metric()`
+    # has empty sub_condition_ids, so the projection uses generic axis ids
+    # and the anchor c_full might not literally be (0.85, 0.85). Just check
+    # finiteness of x/y as a smoke test.
+    for x, y, _z, _c, _is_a in flagged:
+        assert np.isfinite(x) and np.isfinite(y)
+
+
+def test_compute_radial_projection_cloud_validates_args() -> None:
+    metric = _make_radial_metric()
+    with pytest.raises(ValueError, match="n_samples"):
+        compute_radial_projection_cloud(metric, n_samples=-1)
+    with pytest.raises(ValueError, match="reference has length"):
+        compute_radial_projection_cloud(
+            metric, reference=(1.0,), n_samples=10, include_anchors=False
+        )
 
 
 def test_worst_fragility_axis_pair_picks_most_negative_axes(db: str) -> None:

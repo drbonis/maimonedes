@@ -754,22 +754,25 @@ def compute_ratio_surface(
     resolution: int = 30,
     n_segments: int = 12,
 ) -> tuple[list[float], list[float], list[list[float]]]:
-    """Sample a 2D grid → return Z values for a 3D surface plot.
+    """Sample a 2D grid → return topographic Z values for a 3D surface plot.
 
-    Two modes drive the meaning of Z:
+    Convention across both modes: **high Z = stable (hard to traverse
+    compliance-wise); low Z = fragile (easy to traverse, small Euclidean
+    step → large compliance change).** Reads as a topographic map —
+    mountains are stable plateaus, canyons are fragile cliffs.
 
     - `"fixed_reference"` (default): at each grid cell `c`, computes
-      `riemannian_distance(reference, c) / euclidean_distance(reference, c)`.
-      Tall peaks = "compliance-expensive" — moving from the reference
-      to here costs more in Riemannian terms than the Euclidean
-      distance suggests. Reference defaults to the all-compliant point
+      `euclidean_distance(reference, c) / riemannian_distance(reference, c)`.
+      Tall peaks = lots of Euclidean per unit Riemannian = compliance
+      barely moves as you walk from the reference to here = stable
+      plateau. Reference defaults to the all-compliant point
       `(1, 1, ..., 1)`. The cell at the reference itself is NaN
-      (division by zero).
+      (both distances are 0).
 
     - `"local_stretch"`: at each grid cell `c`, computes
-      `√(λ_max(g(c)))` — the magnitude of the steepest local stretch
-      direction. Tall peaks = "compliance landscape is sharply
-      stretched here, regardless of where you came from". No reference
+      `1 / √λ_max(g(c))` — the inverse of the steepest local stretch.
+      Tall peaks = even the steepest local direction needs lots of
+      Euclidean per unit Riemannian = locally stable. No reference
       point.
 
     Returns `(xs, ys, z)` where `xs` / `ys` are the grid coordinates
@@ -820,11 +823,16 @@ def compute_ratio_surface(
                 d_riem = riemannian_distance(
                     metric, ref_arr, c_arr, n_segments=n_segments
                 )
-                row.append(d_riem / d_eucl)
+                if d_riem < 1e-9:
+                    row.append(float("nan"))
+                    continue
+                # Topographic Z: Euclidean per unit Riemannian. High =
+                # need lots of Euclidean to budge compliance = stable.
+                row.append(d_eucl / d_riem)
             z.append(row)
         return xs, ys, z
 
-    # local_stretch
+    # local_stretch — Z = 1 / √λ_max (inverse principal stretch).
     z = []
     for y in ys:
         row = []
@@ -835,9 +843,134 @@ def compute_ratio_surface(
             g = metric_at(metric, np.asarray(c, dtype=np.float64))
             eigvals = np.linalg.eigvalsh(g)
             lam_max = float(eigvals.max())
-            row.append(float(np.sqrt(max(lam_max, 0.0))))
+            sqrt_lam = float(np.sqrt(max(lam_max, 0.0)))
+            if sqrt_lam < 1e-9:
+                row.append(float("nan"))
+            else:
+                # High = small principal stretch = locally stable.
+                row.append(1.0 / sqrt_lam)
         z.append(row)
     return xs, ys, z
+
+
+def compute_radial_projection_cloud(
+    metric: RiemannianMetric,
+    *,
+    reference: tuple[float, ...] | None = None,
+    n_samples: int = 5000,
+    seed: int = 0,
+    include_anchors: bool = True,
+    n_segments: int = 12,
+) -> dict[str, object]:
+    """Star-coordinate scatter cloud — projects k-dim compliance to 2D.
+
+    Each policy axis `i` gets an angular slot `θᵢ = 2π·i/k`. A
+    compliance vector `c ∈ [0,1]^k` projects to:
+        x(c) = Σᵢ cᵢ · cos(θᵢ)
+        y(c) = Σᵢ cᵢ · sin(θᵢ)
+    Z is the topographic ratio `euclidean_distance(reference, c) /
+    riemannian_distance(reference, c)` (high = stable, low = fragile;
+    same convention as `compute_ratio_surface`).
+
+    Returns a dict with:
+      - `points`: list of `(x, y, z, c_full, is_anchor)` tuples.
+      - `axis_labels`: list of `(axis_index, label_x, label_y)` —
+        positions of the radial axis annotations at radius `r_max·1.1`.
+      - `r_max`: max |xy| in the cloud (for plotly axis tickrange).
+      - `reference`: the reference tuple actually used.
+
+    Anchor positions (when `include_anchors=True`) are pulled from
+    `monitor.fragility.all_jacobians()` and added to the cloud with
+    `is_anchor=True`. They use the metric's `sub_condition_ids` axis
+    order so the projection is consistent with the rest of the page.
+
+    The mapping is many-to-one for k > 2 — distinct compliance vectors
+    can project to the same `(x, y)` but with different Z. This is
+    represented honestly in the scatter (overlapping points stack
+    visually). Aggregation is left to the caller.
+    """
+    k = metric.k
+    if k < 2:
+        raise ValueError(f"radial projection needs k >= 2; got k={k}")
+    if n_samples < 0:
+        raise ValueError(f"n_samples must be >= 0; got {n_samples}")
+    if reference is None:
+        reference = tuple(1.0 for _ in range(k))
+    if len(reference) != k:
+        raise ValueError(
+            f"reference has length {len(reference)}; expected k={k}"
+        )
+
+    thetas = np.array(
+        [2.0 * np.pi * i / k for i in range(k)], dtype=np.float64
+    )
+    cos_t = np.cos(thetas)
+    sin_t = np.sin(thetas)
+    ref_arr = np.asarray(reference, dtype=np.float64)
+
+    rng = np.random.default_rng(seed)
+    samples: list[np.ndarray] = []
+    flags: list[bool] = []
+
+    if n_samples > 0:
+        c_random = rng.uniform(0.0, 1.0, size=(n_samples, k))
+        for row in c_random:
+            samples.append(row)
+            flags.append(False)
+
+    if include_anchors:
+        try:
+            from maimonedes.monitor.fragility import all_jacobians
+
+            axes = (
+                tuple(metric.sub_condition_ids)
+                if metric.sub_condition_ids
+                else tuple(f"axis_{i}" for i in range(k))
+            )
+            for _anchor_id, jac in all_jacobians().items():
+                c = np.array(
+                    [jac.baseline_per_sub_condition.get(a, 0.0) for a in axes],
+                    dtype=np.float64,
+                )
+                samples.append(c)
+                flags.append(True)
+        except Exception:
+            # No DB / no anchor data — silently skip; the random samples
+            # still cover the cube.
+            pass
+
+    points: list[tuple[float, float, float, tuple[float, ...], bool]] = []
+    r_max = 0.0
+    for c, is_anchor in zip(samples, flags):
+        x = float(np.dot(c, cos_t))
+        y = float(np.dot(c, sin_t))
+        d_eucl = float(np.linalg.norm(c - ref_arr))
+        if d_eucl < 1e-9:
+            z = float("nan")
+        else:
+            d_riem = riemannian_distance(
+                metric, ref_arr, c, n_segments=n_segments
+            )
+            z = float(d_eucl / d_riem) if d_riem > 1e-9 else float("nan")
+        r = float(np.hypot(x, y))
+        if r > r_max:
+            r_max = r
+        points.append(
+            (x, y, z, tuple(float(v) for v in c.tolist()), is_anchor)
+        )
+
+    label_radius = max(r_max * 1.15, 1.0)
+    axis_labels = [
+        (i, float(label_radius * cos_t[i]), float(label_radius * sin_t[i]))
+        for i in range(k)
+    ]
+
+    return {
+        "points": points,
+        "axis_labels": axis_labels,
+        "r_max": r_max,
+        "reference": tuple(float(v) for v in ref_arr.tolist()),
+    }
 
 
 def worst_fragility_axis_pair(
@@ -886,6 +1019,7 @@ def position_vector(score_per_sub: dict[str, float], axes: Iterable[str]) -> np.
 __all__ = [
     "MetricMLP",
     "RiemannianMetric",
+    "compute_radial_projection_cloud",
     "compute_ratio_surface",
     "euclidean_distance",
     "fit_metric",

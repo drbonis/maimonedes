@@ -34,6 +34,8 @@ from maimonedes.dashboard._metric_snapshots import (
     MetricEllipse,
     MetricFitSnapshot,
     PresetSegment,
+    RadialCloudPoint,
+    RadialCloudSnapshot,
     RatioSurfaceSnapshot,
 )
 from maimonedes.monitor.fragility import all_jacobians
@@ -45,6 +47,7 @@ from maimonedes.monitor.localizer import (
 )
 from maimonedes.monitor.metric import (
     RiemannianMetric,
+    compute_radial_projection_cloud,
     compute_ratio_surface,
     euclidean_distance,
     metric_at,
@@ -818,6 +821,7 @@ def _render() -> None:
     )
 
     _render_3d_ratio_surface(metric, fit, axes, pinned)
+    _render_radial_3d_cloud(metric, fit, axes)
 
 
 @st.cache_data(ttl=10)
@@ -973,14 +977,21 @@ def _render_3d_ratio_surface(
 
     z_arr = np.asarray(snapshot.z, dtype=float)
     z_finite = z_arr[np.isfinite(z_arr)]
-    z_label = "Riemannian / Euclidean" if mode == "fixed_reference" else "√λ_max(g(c))"
+    z_label = (
+        "Euclidean / Riemannian"
+        if mode == "fixed_reference"
+        else "1 / √λ_max(g(c))"
+    )
     fig3d = go.Figure(
         data=[
             go.Surface(
                 x=snapshot.xs,
                 y=snapshot.ys,
                 z=snapshot.z,
-                colorscale="RdBu_r",
+                # Topographic convention: high = stable (blue, mountain
+                # of "compliance-resistance"), low = fragile (red, valley
+                # where compliance erodes fast).
+                colorscale="RdBu",
                 colorbar=dict(title=z_label),
                 contours=dict(
                     z=dict(
@@ -998,7 +1009,7 @@ def _render_3d_ratio_surface(
             go.Scatter3d(
                 x=[reference[axis_i]],
                 y=[reference[axis_j]],
-                z=[float(np.nanmin(z_arr)) if z_finite.size > 0 else 0.0],
+                z=[float(np.nanmax(z_arr)) if z_finite.size > 0 else 0.0],
                 mode="markers+text",
                 marker=dict(size=8, color="black", symbol="diamond"),
                 text=["reference"],
@@ -1019,11 +1030,231 @@ def _render_3d_ratio_surface(
 
     if z_finite.size > 0:
         st.caption(
-            f"Z-axis = {z_label}. min={float(np.nanmin(z_arr)):.3f}, "
+            f"Z-axis = {z_label} (topographic convention: tall peaks = "
+            f"stable, fragile cliffs are deep canyons). "
+            f"min={float(np.nanmin(z_arr)):.3f}, "
             f"max={float(np.nanmax(z_arr)):.3f}, "
-            f"mean={float(np.nanmean(z_arr)):.3f}. Mode={mode}. "
-            f"Tall peaks = fragile cliffs; flat valleys = stable basins."
+            f"mean={float(np.nanmean(z_arr)):.3f}. Mode={mode}."
         )
+
+
+@st.cache_data(ttl=10)
+def _cached_radial_cloud(
+    fit_id: int,
+    fit_path: str,
+    axis_ids: tuple[str, ...],
+    reference: tuple[float, ...],
+    n_samples: int,
+    seed: int,
+    include_anchors: bool,
+) -> RadialCloudSnapshot | None:
+    metric = _load_metric(fit_path)
+    if metric is None:
+        return None
+    try:
+        result = compute_radial_projection_cloud(
+            metric,
+            reference=reference,
+            n_samples=n_samples,
+            seed=seed,
+            include_anchors=include_anchors,
+        )
+    except (ValueError, RuntimeError):
+        return None
+    points = [
+        RadialCloudPoint(
+            x=float(p[0]),
+            y=float(p[1]),
+            z=float(p[2]),
+            c_full=tuple(float(v) for v in p[3]),
+            is_anchor=bool(p[4]),
+        )
+        for p in result["points"]  # type: ignore[index]
+    ]
+    return RadialCloudSnapshot(
+        fit_id=fit_id,
+        n_samples=n_samples,
+        seed=seed,
+        include_anchors=include_anchors,
+        reference=tuple(float(v) for v in result["reference"]),  # type: ignore[index,arg-type]
+        axis_ids=axis_ids,
+        points=points,
+        axis_labels=[
+            (int(label[0]), float(label[1]), float(label[2]))
+            for label in result["axis_labels"]  # type: ignore[index]
+        ],
+        r_max=float(result["r_max"]),  # type: ignore[index,arg-type]
+    )
+
+
+def _render_radial_3d_cloud(
+    metric: RiemannianMetric,
+    fit: MetricFitSnapshot,
+    axes: list[str],
+) -> None:
+    """3D star-coordinate scatter: all k axes radially in (x, y), Z = ratio.
+
+    Star coordinates project each compliance vector c via
+    `(x, y) = Σᵢ cᵢ · (cos θᵢ, sin θᵢ)` with `θᵢ = 2π·i/k`. The mapping
+    is many-to-one for k > 2 (multiple compliance vectors can land at
+    the same (x, y) with different Z) — represented honestly here as
+    overlapping scatter points stacking with different Z values.
+
+    Z = euclidean / riemannian from a chosen reference (default
+    all-compliant). Topographic: high = stable, low = fragile.
+    """
+    if len(axes) < 2:
+        return
+
+    st.subheader("3D radial projection (all k axes → 2D, Z = compliance-resistance)")
+
+    n_samples = st.slider(
+        "Random samples",
+        min_value=500,
+        max_value=10000,
+        value=3000,
+        step=500,
+        help=(
+            "Number of compliance vectors uniformly sampled from "
+            "[0,1]^k. More samples = denser cloud but slower (each "
+            "sample integrates a Riemannian path against the reference)."
+        ),
+    )
+    include_anchors = st.checkbox(
+        "Highlight library anchors",
+        value=True,
+        help="Project library anchor positions onto the cloud as triangle markers.",
+    )
+    seed = st.number_input(
+        "Sampling seed", min_value=0, max_value=10**6, value=0, step=1, key="radial_seed"
+    )
+
+    with st.expander(
+        "Reference point (default = (1, 1, …, 1) full compliance)"
+    ):
+        ref_list = [1.0] * len(axes)
+        for ax_idx, ax_id in enumerate(axes):
+            ref_list[ax_idx] = st.slider(
+                f"reference[{ax_id}]",
+                min_value=0.0,
+                max_value=1.0,
+                value=1.0,
+                step=0.05,
+                key=f"radial_ref_{ax_id}",
+            )
+
+    snapshot = _cached_radial_cloud(
+        fit.fit_id,
+        fit.path,
+        tuple(axes),
+        tuple(ref_list),
+        int(n_samples),
+        int(seed),
+        bool(include_anchors),
+    )
+    if snapshot is None or not snapshot.points:
+        st.warning("Could not compute the radial cloud for this metric.")
+        return
+
+    finite_pts = [p for p in snapshot.points if np.isfinite(p.z)]
+    if not finite_pts:
+        st.warning(
+            "All points landed at the reference (zero distance) — try moving "
+            "the reference."
+        )
+        return
+
+    random_pts = [p for p in finite_pts if not p.is_anchor]
+    anchor_pts = [p for p in finite_pts if p.is_anchor]
+
+    z_values = [p.z for p in finite_pts]
+    z_min = float(min(z_values))
+    z_max = float(max(z_values))
+    z_mean = float(np.mean(z_values))
+
+    fig = go.Figure()
+    if random_pts:
+        fig.add_trace(
+            go.Scatter3d(
+                x=[p.x for p in random_pts],
+                y=[p.y for p in random_pts],
+                z=[p.z for p in random_pts],
+                mode="markers",
+                marker=dict(
+                    size=3,
+                    color=[p.z for p in random_pts],
+                    colorscale="RdBu",
+                    cmin=z_min,
+                    cmax=z_max,
+                    colorbar=dict(title="Eucl / Riem"),
+                    opacity=0.55,
+                ),
+                hovertemplate=(
+                    "x=%{x:.3f}<br>y=%{y:.3f}<br>"
+                    "Z (Eucl/Riem)=%{z:.3f}<extra></extra>"
+                ),
+                name="sampled",
+                showlegend=False,
+            )
+        )
+    if anchor_pts:
+        fig.add_trace(
+            go.Scatter3d(
+                x=[p.x for p in anchor_pts],
+                y=[p.y for p in anchor_pts],
+                z=[p.z for p in anchor_pts],
+                mode="markers",
+                marker=dict(
+                    size=8,
+                    color="black",
+                    symbol="diamond",
+                    line=dict(color="white", width=1),
+                ),
+                name="library anchors",
+                showlegend=True,
+            )
+        )
+
+    # Axis labels around the unit circle so the operator can read which
+    # radial direction corresponds to which policy axis.
+    for ax_idx, lx, ly in snapshot.axis_labels:
+        ax_id = axes[ax_idx] if ax_idx < len(axes) else f"axis_{ax_idx}"
+        fig.add_trace(
+            go.Scatter3d(
+                x=[0, lx],
+                y=[0, ly],
+                z=[z_mean, z_mean],
+                mode="lines+text",
+                line=dict(color="grey", width=2, dash="dot"),
+                text=["", ax_id],
+                textposition="top center",
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+    fig.update_layout(
+        scene=dict(
+            xaxis_title="x (radial projection)",
+            yaxis_title="y (radial projection)",
+            zaxis_title="Eucl / Riem (high = stable)",
+        ),
+        margin=dict(l=0, r=0, t=10, b=0),
+        height=650,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    n_anchor = len(anchor_pts)
+    n_random = len(random_pts)
+    st.caption(
+        f"Star-coord projection of c ∈ [0,1]^{len(axes)} → (x, y); "
+        f"Z = euclidean / riemannian from reference. Topographic "
+        f"convention: tall = stable, low = fragile. "
+        f"{n_random} random samples + {n_anchor} library anchors. "
+        f"Z range: min={z_min:.3f}, max={z_max:.3f}, mean={z_mean:.3f}. "
+        f"Note: balanced compliance vectors land near the origin "
+        f"(Σ unit-vectors = 0); imbalanced ones spread to the periphery."
+    )
 
 
 _render()

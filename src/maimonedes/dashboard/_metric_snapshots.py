@@ -96,11 +96,11 @@ class DistanceComparison:
 
 @dataclass
 class RatioSurfaceSnapshot:
-    """Z-grid for the 3D ratio-surface plot.
+    """Z-grid for the 3D ratio-surface plot (topographic convention).
 
-    `mode` is `"fixed_reference"` (Z = riemannian/euclidean from `reference`)
-    or `"local_stretch"` (Z = √λ_max(g(c))). `reference` is None in the
-    local-stretch mode.
+    Z is `euclidean/riemannian` (fixed_reference) or `1/√λ_max(g(c))`
+    (local_stretch). High = stable plateau; low = fragile cliff.
+    `reference` is None in local-stretch mode.
     """
 
     fit_id: int
@@ -116,6 +116,38 @@ class RatioSurfaceSnapshot:
     z: list[list[float]]
 
 
+@dataclass
+class RadialCloudPoint:
+    """One sampled compliance vector projected to 2D star-coordinates."""
+
+    x: float
+    y: float
+    z: float  # NaN at the reference point
+    c_full: tuple[float, ...]
+    is_anchor: bool
+
+
+@dataclass
+class RadialCloudSnapshot:
+    """Star-coordinate scatter cloud + radial axis labels.
+
+    Each point projects c ∈ [0,1]^k via star coords (each axis at angle
+    2π·i/k) into (x, y); Z = euclidean/riemannian from `reference`
+    (high = stable, low = fragile). The mapping is many-to-one for
+    k > 2; collisions stack visually in the scatter.
+    """
+
+    fit_id: int
+    n_samples: int
+    seed: int
+    include_anchors: bool
+    reference: tuple[float, ...]
+    axis_ids: tuple[str, ...]
+    points: list[RadialCloudPoint]
+    axis_labels: list[tuple[int, float, float]]  # (axis_index, label_x, label_y)
+    r_max: float
+
+
 __all__ = [
     "AnchorOverlay",
     "DistanceComparison",
@@ -123,5 +155,7 @@ __all__ = [
     "MetricEllipse",
     "MetricFitSnapshot",
     "PresetSegment",
+    "RadialCloudPoint",
+    "RadialCloudSnapshot",
     "RatioSurfaceSnapshot",
 ]
