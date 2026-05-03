@@ -28,11 +28,13 @@ from maimonedes.monitor.metric import (
     _build_lower_triangular,
     _build_lower_triangular_grad,
     _frobenius_loss_and_grad,
+    compute_ratio_surface,
     euclidean_distance,
     fit_metric,
     fit_metric_from_pairs,
     metric_at,
     riemannian_distance,
+    worst_fragility_axis_pair,
 )
 from maimonedes.monitor.localizer import boundary_distance
 from maimonedes.settings import Settings
@@ -481,3 +483,156 @@ def test_fit_metric_errors_when_no_anchors_exist(db: str, tmp_path: Path) -> Non
     # No anchors seeded → fit raises ValueError → CLI exits 2.
     assert result.exit_code == 2, result.output
     assert "no anchor Jacobians" in result.output
+
+
+# ---------------------------------------------------------------------------
+# 3D ratio-surface helpers (dashboard `06_metric.py` 3D view)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_ratio_surface_fixed_reference_shape_and_finite() -> None:
+    metric = _make_radial_metric()
+    xs, ys, z = compute_ratio_surface(
+        metric,
+        axis_indices=(0, 1),
+        pinned=(1.0, 1.0),
+        mode="fixed_reference",
+        reference=(1.0, 1.0),
+        resolution=8,
+    )
+    assert len(xs) == 8 and len(ys) == 8
+    assert len(z) == 8 and all(len(row) == 8 for row in z)
+    z_arr = np.asarray(z, dtype=float)
+    # All non-NaN cells must be positive (Riemannian distance / Euclidean).
+    assert np.all((np.isnan(z_arr)) | (z_arr > 0))
+    # The reference cell at (x=1, y=1) is NaN (Euclidean=0 there).
+    assert np.isnan(z_arr[-1, -1])
+    # At least some cells are not at the reference, so they're finite.
+    assert np.isfinite(z_arr).any()
+
+
+def test_compute_ratio_surface_local_stretch_is_positive() -> None:
+    """Local stretch √λ_max(g(c)) is well-defined everywhere (no reference)."""
+    metric = _make_radial_metric()
+    xs, ys, z = compute_ratio_surface(
+        metric,
+        axis_indices=(0, 1),
+        pinned=(0.5, 0.5),
+        mode="local_stretch",
+        resolution=6,
+    )
+    z_arr = np.asarray(z, dtype=float)
+    assert z_arr.shape == (6, 6)
+    assert np.all(np.isfinite(z_arr))
+    assert np.all(z_arr > 0)
+
+
+def test_compute_ratio_surface_fixed_reference_amplifies_near_boundary() -> None:
+    """The §4.6 narrative: cells near the violation boundary should have a
+    Riemannian/Euclidean ratio > 1 (the radial metric has scale > 1 there)."""
+    metric = _make_radial_metric()
+    _, _, z = compute_ratio_surface(
+        metric,
+        axis_indices=(0, 1),
+        pinned=(1.0, 1.0),
+        mode="fixed_reference",
+        reference=(1.0, 1.0),
+        resolution=10,
+    )
+    z_arr = np.asarray(z, dtype=float)
+    # Cell at (~0.0, ~0.0) — corner, deepest into the violation region —
+    # is far from the reference and crosses the high-scale region.
+    corner = z_arr[0, 0]
+    assert np.isfinite(corner)
+    assert corner > 1.0, (
+        f"corner ratio {corner:.3f} should be > 1 for the radial metric"
+    )
+
+
+def test_compute_ratio_surface_rejects_invalid_args() -> None:
+    metric = _make_radial_metric()
+    with pytest.raises(ValueError, match="axis_indices"):
+        compute_ratio_surface(
+            metric,
+            axis_indices=(0, 0),
+            pinned=(0.0, 0.0),
+            resolution=4,
+        )
+    with pytest.raises(ValueError, match="resolution"):
+        compute_ratio_surface(
+            metric,
+            axis_indices=(0, 1),
+            pinned=(0.0, 0.0),
+            resolution=1,
+        )
+    with pytest.raises(ValueError, match="unknown mode"):
+        compute_ratio_surface(
+            metric,
+            axis_indices=(0, 1),
+            pinned=(0.0, 0.0),
+            mode="bogus",
+            resolution=4,
+        )
+    with pytest.raises(ValueError, match="pinned has length"):
+        compute_ratio_surface(
+            metric,
+            axis_indices=(0, 1),
+            pinned=(0.0,),  # k=2 but only 1 pinned
+            resolution=4,
+        )
+
+
+def test_worst_fragility_axis_pair_falls_back_when_no_data(db: str) -> None:
+    """No perturbation data in the DB → fallback to the supplied default."""
+    pair = worst_fragility_axis_pair(
+        sub_condition_ids=("a", "b", "c"), fallback=(0, 2)
+    )
+    assert pair == (0, 2)
+
+
+def test_worst_fragility_axis_pair_picks_most_negative_axes(db: str) -> None:
+    """Seed perturbation data where two axes have strongly negative drops.
+    The helper should rank those two as the worst-fragility pair."""
+    sub_ids = ("a", "b", "c", "d")
+    # Anchor baseline (probe_role=anchor) at score=0.9 across all axes.
+    record_score(
+        ComplianceScore(
+            anchor_id="ANCH",
+            policy_id="p",
+            per_sub_condition={s: 0.9 for s in sub_ids},
+            aggregate=0.9,
+            judge_model="j",
+            supervised_model="s",
+        )
+    )
+    # Three perturbation_probes with scores that drop axes 'b' and 'd'
+    # the most. axes 'a' and 'c' are roughly stable.
+    drops = [
+        {"a": 0.85, "b": 0.10, "c": 0.85, "d": 0.05},
+        {"a": 0.85, "b": 0.05, "c": 0.85, "d": 0.10},
+        {"a": 0.85, "b": 0.10, "c": 0.85, "d": 0.10},
+    ]
+    for i, per_sub in enumerate(drops):
+        probe = PerturbationProbe(
+            anchor_id="ANCH",
+            scenario=f"perturb-{i}",
+            perturbation_kind="authority",
+            transform_label=f"authority:{i}",
+            generator_metadata={},
+        )
+        pid = record_perturbation(probe)
+        record_score(
+            ComplianceScore(
+                anchor_id="ANCH",
+                policy_id="p",
+                per_sub_condition=per_sub,
+                aggregate=float(np.mean(list(per_sub.values()))),
+                judge_model="j",
+                supervised_model="s",
+                perturbation_id=pid,
+                probe_role="perturbation",
+            )
+        )
+    pair = worst_fragility_axis_pair(sub_condition_ids=sub_ids, fallback=(0, 1))
+    # 'b' and 'd' are at indices 1 and 3.
+    assert set(pair) == {1, 3}

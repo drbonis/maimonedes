@@ -34,6 +34,7 @@ from maimonedes.dashboard._metric_snapshots import (
     MetricEllipse,
     MetricFitSnapshot,
     PresetSegment,
+    RatioSurfaceSnapshot,
 )
 from maimonedes.monitor.fragility import all_jacobians
 from maimonedes.monitor.localizer import (
@@ -44,9 +45,11 @@ from maimonedes.monitor.localizer import (
 )
 from maimonedes.monitor.metric import (
     RiemannianMetric,
+    compute_ratio_surface,
     euclidean_distance,
     metric_at,
     riemannian_distance,
+    worst_fragility_axis_pair,
 )
 from maimonedes.storage.metric_fits import list_metric_fits
 
@@ -813,6 +816,214 @@ def _render() -> None:
         f"(darker = closer to the boundary). "
         f"k={len(axes)}; metric_fit #{fit.fit_id}."
     )
+
+    _render_3d_ratio_surface(metric, fit, axes, pinned)
+
+
+@st.cache_data(ttl=10)
+def _cached_ratio_surface(
+    fit_id: int,
+    fit_path: str,
+    axis_i: int,
+    axis_j: int,
+    axis_i_id: str,
+    axis_j_id: str,
+    pinned: tuple[float, ...],
+    mode: str,
+    reference: tuple[float, ...] | None,
+    resolution: int,
+) -> RatioSurfaceSnapshot | None:
+    metric = _load_metric(fit_path)
+    if metric is None:
+        return None
+    try:
+        xs, ys, z = compute_ratio_surface(
+            metric,
+            axis_indices=(axis_i, axis_j),
+            pinned=pinned,
+            mode=mode,
+            reference=reference,
+            resolution=resolution,
+        )
+    except (ValueError, RuntimeError):
+        return None
+    return RatioSurfaceSnapshot(
+        fit_id=fit_id,
+        mode=mode,
+        axis_i=axis_i,
+        axis_j=axis_j,
+        axis_i_id=axis_i_id,
+        axis_j_id=axis_j_id,
+        pinned=pinned,
+        reference=reference,
+        xs=xs,
+        ys=ys,
+        z=z,
+    )
+
+
+def _render_3d_ratio_surface(
+    metric: RiemannianMetric,
+    fit: MetricFitSnapshot,
+    axes: list[str],
+    pinned: list[float],
+) -> None:
+    """3D-surface view: Riemannian/Euclidean ratio (or local stretch) over a pair.
+
+    The 2D plot above shows `√det(g(c))` as a heatmap; this section
+    answers a slightly different question — "starting from a fixed
+    compliant reference, how compliance-expensive is reaching this
+    coordinate point?" Tall peaks in the surface are the cliffs; flat
+    valleys are where Riemannian geometry agrees with Euclidean (i.e.,
+    safe to navigate).
+    """
+    if len(axes) < 2:
+        return
+
+    st.subheader("3D fragility landscape (Riemannian / Euclidean)")
+
+    mode_label = st.radio(
+        "Surface mode",
+        options=["Fixed reference", "Local stretch (√λ_max)"],
+        horizontal=True,
+        index=0,
+        help=(
+            "**Fixed reference**: Z = riemannian / euclidean from a chosen "
+            "reference point. Tall peaks are 'compliance-expensive' regions "
+            "— small Euclidean step, large Riemannian step. **Local "
+            "stretch**: Z = √λ_max(g(c)). No reference; tall peaks are "
+            "regions where the metric is locally sharp regardless of where "
+            "you came from."
+        ),
+    )
+    mode = "fixed_reference" if mode_label == "Fixed reference" else "local_stretch"
+
+    # Pick the worst-fragility axis pair as defaults.
+    default_i, default_j = worst_fragility_axis_pair(
+        sub_condition_ids=tuple(axes), fallback=(0, 1)
+    )
+
+    col_x3, col_y3 = st.columns(2)
+    axis_i_id = col_x3.selectbox(
+        "X axis",
+        options=axes,
+        index=default_i,
+        key="ratio3d_x",
+    )
+    y_options = [a for a in axes if a != axis_i_id]
+    default_j_in_y = (
+        y_options.index(axes[default_j])
+        if axes[default_j] in y_options
+        else 0
+    )
+    axis_j_id = col_y3.selectbox(
+        "Y axis",
+        options=y_options,
+        index=default_j_in_y,
+        key="ratio3d_y",
+    )
+    axis_i = axes.index(axis_i_id)
+    axis_j = axes.index(axis_j_id)
+
+    reference: tuple[float, ...] | None = None
+    if mode == "fixed_reference":
+        with st.expander(
+            "Reference point (default = (1, 1, …, 1) full compliance)"
+        ):
+            ref_list = [1.0] * len(axes)
+            for ax_idx, ax_id in enumerate(axes):
+                ref_list[ax_idx] = st.slider(
+                    f"reference[{ax_id}]",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=1.0,
+                    step=0.05,
+                    key=f"ratio3d_ref_{ax_id}",
+                )
+            reference = tuple(ref_list)
+
+    resolution = st.slider(
+        "Grid resolution",
+        min_value=10,
+        max_value=50,
+        value=25,
+        step=5,
+        help=(
+            "Higher resolution = smoother surface but more compute. The "
+            "fixed-reference mode integrates a Riemannian path per cell, "
+            "so resolution=50 takes a few seconds."
+        ),
+    )
+
+    snapshot = _cached_ratio_surface(
+        fit.fit_id,
+        fit.path,
+        axis_i,
+        axis_j,
+        axis_i_id,
+        axis_j_id,
+        tuple(pinned),
+        mode,
+        reference,
+        resolution,
+    )
+    if snapshot is None:
+        st.warning("Could not compute the 3D ratio surface for this slice.")
+        return
+
+    z_arr = np.asarray(snapshot.z, dtype=float)
+    z_finite = z_arr[np.isfinite(z_arr)]
+    z_label = "Riemannian / Euclidean" if mode == "fixed_reference" else "√λ_max(g(c))"
+    fig3d = go.Figure(
+        data=[
+            go.Surface(
+                x=snapshot.xs,
+                y=snapshot.ys,
+                z=snapshot.z,
+                colorscale="RdBu_r",
+                colorbar=dict(title=z_label),
+                contours=dict(
+                    z=dict(
+                        show=True,
+                        usecolormap=True,
+                        highlightcolor="black",
+                        project=dict(z=True),
+                    )
+                ),
+            )
+        ]
+    )
+    if mode == "fixed_reference" and reference is not None:
+        fig3d.add_trace(
+            go.Scatter3d(
+                x=[reference[axis_i]],
+                y=[reference[axis_j]],
+                z=[float(np.nanmin(z_arr)) if z_finite.size > 0 else 0.0],
+                mode="markers+text",
+                marker=dict(size=8, color="black", symbol="diamond"),
+                text=["reference"],
+                textposition="top center",
+                showlegend=False,
+            )
+        )
+    fig3d.update_layout(
+        scene=dict(
+            xaxis_title=axis_i_id,
+            yaxis_title=axis_j_id,
+            zaxis_title=z_label,
+        ),
+        margin=dict(l=0, r=0, t=10, b=0),
+        height=600,
+    )
+    st.plotly_chart(fig3d, use_container_width=True)
+
+    if z_finite.size > 0:
+        st.caption(
+            f"Z-axis = {z_label}. min={float(np.nanmin(z_arr)):.3f}, "
+            f"max={float(np.nanmax(z_arr)):.3f}, "
+            f"mean={float(np.nanmean(z_arr)):.3f}. Mode={mode}. "
+            f"Tall peaks = fragile cliffs; flat valleys = stable basins."
+        )
 
 
 _render()

@@ -94,6 +94,28 @@ class DistanceComparison:
     ratio: float | None
 
 
+@dataclass
+class RatioSurfaceSnapshot:
+    """Z-grid for the 3D ratio-surface plot.
+
+    `mode` is `"fixed_reference"` (Z = riemannian/euclidean from `reference`)
+    or `"local_stretch"` (Z = √λ_max(g(c))). `reference` is None in the
+    local-stretch mode.
+    """
+
+    fit_id: int
+    mode: str
+    axis_i: int
+    axis_j: int
+    axis_i_id: str
+    axis_j_id: str
+    pinned: tuple[float, ...]
+    reference: tuple[float, ...] | None
+    xs: list[float]
+    ys: list[float]
+    z: list[list[float]]
+
+
 __all__ = [
     "AnchorOverlay",
     "DistanceComparison",
@@ -101,4 +123,5 @@ __all__ = [
     "MetricEllipse",
     "MetricFitSnapshot",
     "PresetSegment",
+    "RatioSurfaceSnapshot",
 ]

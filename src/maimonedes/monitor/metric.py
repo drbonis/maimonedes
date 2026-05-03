@@ -737,6 +737,147 @@ def euclidean_distance(c0: np.ndarray, c1: np.ndarray) -> float:
     return float(np.linalg.norm(np.asarray(c1) - np.asarray(c0)))
 
 
+# ---------------------------------------------------------------------------
+# 3D-surface helpers (dashboard `06_metric.py` 3D ratio view)
+# ---------------------------------------------------------------------------
+
+RatioMode = "fixed_reference"  # alias kept as a string Literal in callers
+
+
+def compute_ratio_surface(
+    metric: RiemannianMetric,
+    *,
+    axis_indices: tuple[int, int],
+    pinned: tuple[float, ...],
+    mode: str = "fixed_reference",
+    reference: tuple[float, ...] | None = None,
+    resolution: int = 30,
+    n_segments: int = 12,
+) -> tuple[list[float], list[float], list[list[float]]]:
+    """Sample a 2D grid → return Z values for a 3D surface plot.
+
+    Two modes drive the meaning of Z:
+
+    - `"fixed_reference"` (default): at each grid cell `c`, computes
+      `riemannian_distance(reference, c) / euclidean_distance(reference, c)`.
+      Tall peaks = "compliance-expensive" — moving from the reference
+      to here costs more in Riemannian terms than the Euclidean
+      distance suggests. Reference defaults to the all-compliant point
+      `(1, 1, ..., 1)`. The cell at the reference itself is NaN
+      (division by zero).
+
+    - `"local_stretch"`: at each grid cell `c`, computes
+      `√(λ_max(g(c)))` — the magnitude of the steepest local stretch
+      direction. Tall peaks = "compliance landscape is sharply
+      stretched here, regardless of where you came from". No reference
+      point.
+
+    Returns `(xs, ys, z)` where `xs` / `ys` are the grid coordinates
+    (length `resolution`) and `z` is a list-of-lists of the same shape
+    suitable for `plotly.graph_objects.Surface(z=z, x=xs, y=ys)`.
+    """
+    k = metric.k
+    if len(pinned) != k:
+        raise ValueError(
+            f"pinned has length {len(pinned)}; expected k={k}"
+        )
+    i, j = axis_indices
+    if not (0 <= i < k) or not (0 <= j < k) or i == j:
+        raise ValueError(
+            f"axis_indices={axis_indices} invalid for k={k} (must be "
+            f"distinct in [0, {k}))"
+        )
+    if resolution < 2:
+        raise ValueError("resolution must be >= 2")
+    if mode not in ("fixed_reference", "local_stretch"):
+        raise ValueError(
+            f"unknown mode {mode!r}; expected 'fixed_reference' or 'local_stretch'"
+        )
+
+    xs = np.linspace(0.0, 1.0, resolution).tolist()
+    ys = np.linspace(0.0, 1.0, resolution).tolist()
+
+    if mode == "fixed_reference":
+        if reference is None:
+            reference = tuple(1.0 for _ in range(k))
+        if len(reference) != k:
+            raise ValueError(
+                f"reference has length {len(reference)}; expected k={k}"
+            )
+        ref_arr = np.asarray(reference, dtype=np.float64)
+        z: list[list[float]] = []
+        for y in ys:
+            row: list[float] = []
+            for x in xs:
+                c = list(pinned)
+                c[i] = float(x)
+                c[j] = float(y)
+                c_arr = np.asarray(c, dtype=np.float64)
+                d_eucl = float(np.linalg.norm(c_arr - ref_arr))
+                if d_eucl < 1e-9:
+                    row.append(float("nan"))
+                    continue
+                d_riem = riemannian_distance(
+                    metric, ref_arr, c_arr, n_segments=n_segments
+                )
+                row.append(d_riem / d_eucl)
+            z.append(row)
+        return xs, ys, z
+
+    # local_stretch
+    z = []
+    for y in ys:
+        row = []
+        for x in xs:
+            c = list(pinned)
+            c[i] = float(x)
+            c[j] = float(y)
+            g = metric_at(metric, np.asarray(c, dtype=np.float64))
+            eigvals = np.linalg.eigvalsh(g)
+            lam_max = float(eigvals.max())
+            row.append(float(np.sqrt(max(lam_max, 0.0))))
+        z.append(row)
+    return xs, ys, z
+
+
+def worst_fragility_axis_pair(
+    *,
+    sub_condition_ids: tuple[str, ...] | list[str],
+    fallback: tuple[int, int] = (0, 1),
+) -> tuple[int, int]:
+    """Pick the two indices with the most-negative aggregated fragility cells.
+
+    Returns indices into `sub_condition_ids`. Falls back to `fallback`
+    when `aggregated_fragility()` has no usable data (e.g., the dev
+    DB hasn't seen any perturbations yet) or when the rubric and the
+    fragility table use different axis names.
+    """
+    try:
+        from maimonedes.monitor.fragility import aggregated_fragility
+
+        table = aggregated_fragility(include_synthesized=False)
+    except Exception:
+        return fallback
+    if not table.cells:
+        return fallback
+    # Per-axis severity: minimum mean_delta across all perturbation_kinds
+    # for that axis (the most negative drop the axis ever experienced).
+    severity: dict[str, float] = {}
+    for cell in table.cells:
+        if cell.column not in sub_condition_ids:
+            continue  # skip the "aggregate" row + any out-of-rubric column
+        cur = severity.get(cell.column, float("inf"))
+        if cell.mean_delta < cur:
+            severity[cell.column] = float(cell.mean_delta)
+    if len(severity) < 2:
+        return fallback
+    sorted_axes = sorted(severity.items(), key=lambda kv: kv[1])
+    a_id = sorted_axes[0][0]
+    b_id = sorted_axes[1][0]
+    sub_list = list(sub_condition_ids)
+    return sub_list.index(a_id), sub_list.index(b_id)
+
+
 def position_vector(score_per_sub: dict[str, float], axes: Iterable[str]) -> np.ndarray:
     """Project a `per_sub_condition` dict onto a fixed axis order."""
     return np.asarray([score_per_sub.get(a, 0.0) for a in axes], dtype=np.float64)
@@ -745,10 +886,12 @@ def position_vector(score_per_sub: dict[str, float], axes: Iterable[str]) -> np.
 __all__ = [
     "MetricMLP",
     "RiemannianMetric",
+    "compute_ratio_surface",
     "euclidean_distance",
     "fit_metric",
     "fit_metric_from_pairs",
     "metric_at",
     "position_vector",
     "riemannian_distance",
+    "worst_fragility_axis_pair",
 ]
