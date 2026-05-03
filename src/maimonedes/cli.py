@@ -1247,6 +1247,14 @@ def perturb_cmd(
         "--all-synthesized",
         help="Sweep every approved row in synthesized_probes (skip rejected).",
     ),
+    skip_existing: bool = typer.Option(
+        False,
+        "--skip-existing",
+        help="With --all-synthesized: skip approved probes that already have "
+        "at least one perturbation_probes row. Lets repeat-runs add only "
+        "perturbations for newly-synthesized probes without re-spending the "
+        "LLM budget on existing clouds.",
+    ),
     kinds: str = typer.Option(
         ",".join(ALL_KINDS),
         "--kinds",
@@ -1306,6 +1314,10 @@ def perturb_cmd(
             "Pass exactly one of: <anchor-id>, --all-anchors, "
             "--synthesized <id>, --all-synthesized."
         )
+    if skip_existing and not all_synthesized:
+        raise typer.BadParameter(
+            "--skip-existing only applies with --all-synthesized."
+        )
     if replicates < 1:
         raise typer.BadParameter("--replicates must be >= 1.")
     if replicates > 1 and replay:
@@ -1359,12 +1371,42 @@ def perturb_cmd(
             policy_id=policy.id, quality_status="approved"
         )
         synth_targets = [p.id for p in approved if p.id is not None]
+        if skip_existing and synth_targets:
+            from sqlalchemy import select
+            from maimonedes.storage.perturbations import PerturbationProbeRow
+            from maimonedes.storage.repo import get_session
+
+            with get_session() as session:
+                already = set(
+                    session.execute(
+                        select(PerturbationProbeRow.synthesized_probe_id)
+                        .where(
+                            PerturbationProbeRow.synthesized_probe_id.in_(synth_targets)
+                        )
+                        .distinct()
+                    ).scalars()
+                )
+            before = len(synth_targets)
+            synth_targets = [sid for sid in synth_targets if sid not in already]
+            skipped = before - len(synth_targets)
+            if skipped:
+                typer.echo(
+                    f"--skip-existing: skipped {skipped} synthesized probe(s) "
+                    f"with existing perturbation rows."
+                )
         if not synth_targets:
-            typer.echo(
-                "no approved synthesized probes for this policy; "
-                "run `maimonedes synthesize-probes` first.",
-                err=True,
-            )
+            if all_synthesized and skip_existing:
+                typer.echo(
+                    "no approved synthesized probes need perturbing "
+                    "(all already have clouds).",
+                    err=True,
+                )
+            else:
+                typer.echo(
+                    "no approved synthesized probes for this policy; "
+                    "run `maimonedes synthesize-probes` first.",
+                    err=True,
+                )
             raise typer.Exit(code=4)
 
     target_ids: list[str]

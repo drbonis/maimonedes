@@ -609,3 +609,118 @@ def test_cli_perturb_all_synthesized_empty_dataset_exits_4(
     )
     assert result.exit_code == 4
     assert "no approved synthesized probes" in result.output
+
+
+def test_cli_perturb_skip_existing_filters_already_perturbed(
+    db: str, policy: Policy, cli_backend: FakeLLMClient
+) -> None:
+    """`--all-synthesized --skip-existing` skips approved probes that already
+    have at least one perturbation_probes row, runs only the rest."""
+    from maimonedes.core.perturbation import PerturbationProbe
+    from maimonedes.storage.perturbations import record_perturbation
+
+    done = _seed_synthesized_probe(policy)
+    todo = _seed_synthesized_probe(policy)
+    _seed_synth_anchor_baseline(synthesized_probe_id=todo, policy=policy)
+    _seed_synth_anchor_baseline(synthesized_probe_id=done, policy=policy)
+    # Plant a single perturbation_probes row against `done` so the
+    # skip-existing filter has something to find.
+    record_perturbation(
+        PerturbationProbe(
+            anchor_id=synth_anchor_id(done),
+            scenario="seeded perturbation",
+            perturbation_kind="authority",
+            transform_label="authority:gp",
+            generator_metadata={},
+            synthesized_probe_id=done,
+        )
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "perturb",
+            "--all-synthesized",
+            "--skip-existing",
+            "--kinds",
+            "authority,boundary",
+            "--policy",
+            str(POLICY_PATH),
+            "--rubric",
+            str(RUBRIC_PATH),
+            "--probes",
+            str(PROBES_PATH),
+            "--authority-path",
+            str(AUTH_PATH),
+            "--boundary-path",
+            str(BOUND_PATH),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "skipped 1 synthesized probe" in result.output
+    assert f"synth-{todo}" in result.output
+    # `done` doesn't appear in the per-target stream because we filtered
+    # it out before iteration.
+    assert f"[1/1] synth-{todo}" in result.output
+
+
+def test_cli_perturb_skip_existing_all_done_exits_4(
+    db: str, policy: Policy, cli_backend: FakeLLMClient
+) -> None:
+    """Every approved probe already has perturbations → nothing to do → exit 4."""
+    from maimonedes.core.perturbation import PerturbationProbe
+    from maimonedes.storage.perturbations import record_perturbation
+
+    sid = _seed_synthesized_probe(policy)
+    _seed_synth_anchor_baseline(synthesized_probe_id=sid, policy=policy)
+    record_perturbation(
+        PerturbationProbe(
+            anchor_id=synth_anchor_id(sid),
+            scenario="seeded",
+            perturbation_kind="authority",
+            transform_label="authority:gp",
+            generator_metadata={},
+            synthesized_probe_id=sid,
+        )
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "perturb",
+            "--all-synthesized",
+            "--skip-existing",
+            "--policy",
+            str(POLICY_PATH),
+            "--rubric",
+            str(RUBRIC_PATH),
+            "--probes",
+            str(PROBES_PATH),
+        ],
+    )
+    assert result.exit_code == 4
+    assert "all already have clouds" in result.output
+
+
+def test_cli_perturb_skip_existing_without_all_synthesized_rejected(
+    db: str, policy: Policy, cli_backend: FakeLLMClient
+) -> None:
+    """`--skip-existing` is only valid in combination with `--all-synthesized`."""
+    sid = _seed_synthesized_probe(policy)
+    result = runner.invoke(
+        app,
+        [
+            "perturb",
+            "--synthesized",
+            str(sid),
+            "--skip-existing",
+            "--policy",
+            str(POLICY_PATH),
+            "--rubric",
+            str(RUBRIC_PATH),
+            "--probes",
+            str(PROBES_PATH),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "--skip-existing only applies" in result.output
