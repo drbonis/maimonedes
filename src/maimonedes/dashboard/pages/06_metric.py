@@ -29,10 +29,13 @@ from maimonedes.core.compliance import ComplianceScore
 from maimonedes.core.policy import Policy, load_policy
 from maimonedes.dashboard._metric_snapshots import (
     AnchorOverlay,
+    BoundaryGradientArrow,
     DistanceComparison,
     GridSnapshot,
     MetricEllipse,
     MetricFitSnapshot,
+    PerturbationArrow,
+    PerturbationEfficiencyEntry,
     PresetSegment,
     RadialCloudPoint,
     RadialCloudSnapshot,
@@ -47,10 +50,12 @@ from maimonedes.monitor.localizer import (
 )
 from maimonedes.monitor.metric import (
     RiemannianMetric,
+    boundary_gradient_contravariant,
     compute_radial_projection_cloud,
     compute_ratio_surface,
     euclidean_distance,
     metric_at,
+    perturbation_efficiency,
     riemannian_distance,
     worst_fragility_axis_pair,
 )
@@ -804,6 +809,44 @@ def _render() -> None:
         )
 
     st.subheader("Compliance plane")
+
+    # Perturbation-direction overlays (operator can toggle each layer
+    # independently — see _build_*_arrows + _add_arrow_overlays).
+    overlay_cols = st.columns(2)
+    show_boundary_grad = overlay_cols[0].checkbox(
+        "Show boundary-gradient arrows (−g⁻¹·w)",
+        value=True,
+        help=(
+            "Steepest Riemannian descent toward the violation boundary at "
+            "each anchor. Black arrows. The contravariant gradient of the "
+            "linear margin s(c)=w·(c-τ) under the metric — accounts for "
+            "the fact that some Δc directions are 'free' under g."
+        ),
+    )
+    show_perturb_quiver = overlay_cols[1].checkbox(
+        "Show Jacobian-column quiver (per-perturbation-type arrows)",
+        value=False,
+        help=(
+            "At each anchor, the projection of every Jacobian row's Δ "
+            "vector onto the chosen 2D plane. One colour per "
+            "perturbation_kind. Compare with the boundary-gradient arrow "
+            "to see which perturbations align with the descent direction "
+            "(= efficient at breaking compliance) vs which are wasted."
+        ),
+    )
+
+    boundary_arrows: list[BoundaryGradientArrow] = []
+    perturb_arrows: list[PerturbationArrow] = []
+    if policy is not None and (show_boundary_grad or show_perturb_quiver):
+        if show_boundary_grad:
+            boundary_arrows = _build_boundary_gradient_arrows(
+                metric, policy, axis_i, axis_j, snapshot.anchors
+            )
+        if show_perturb_quiver:
+            perturb_arrows = _build_perturbation_arrows(
+                metric, policy, axis_i, axis_j, snapshot.anchors
+            )
+
     fig = _build_figure(
         snapshot,
         axis_i_label=axis_i_id,
@@ -811,6 +854,13 @@ def _render() -> None:
         overlays=overlays,
         custom_pair=custom_pair,
     )
+    if boundary_arrows or perturb_arrows:
+        _add_arrow_overlays(
+            fig,
+            boundary_arrows=boundary_arrows,
+            perturbation_arrows=perturb_arrows,
+            arrow_scale=_arrow_scale(snapshot.anchors),
+        )
     st.plotly_chart(fig, use_container_width=True)
     st.caption(
         f"Heatmap colour = √det(g(c)). Ellipses = unit ball of g on the "
@@ -819,6 +869,9 @@ def _render() -> None:
         f"(darker = closer to the boundary). "
         f"k={len(axes)}; metric_fit #{fit.fit_id}."
     )
+
+    if policy is not None:
+        _render_perturbation_efficiency(metric, policy)
 
     _render_3d_ratio_surface(metric, fit, axes, pinned)
     _render_radial_3d_cloud(metric, fit, axes)
@@ -1254,6 +1307,337 @@ def _render_radial_3d_cloud(
         f"Z range: min={z_min:.3f}, max={z_max:.3f}, mean={z_mean:.3f}. "
         f"Note: balanced compliance vectors land near the origin "
         f"(Σ unit-vectors = 0); imbalanced ones spread to the periphery."
+    )
+
+
+def _arrow_scale(
+    anchors: list[AnchorOverlay],
+    *,
+    fraction: float = 0.06,
+) -> float:
+    """Scale arrows so the longest one spans `fraction` of the [0,1] plot.
+
+    Arrows otherwise wildly over- or under-shoot when the metric's
+    contravariant gradient has a large magnitude (small λ_min in g).
+    The 0.06 default keeps a single arrow ≤ ~6% of the plot width,
+    which keeps the heatmap legible.
+    """
+    return float(fraction)
+
+
+def _build_boundary_gradient_arrows(
+    metric: RiemannianMetric,
+    policy: Policy,
+    axis_i: int,
+    axis_j: int,
+    anchors: list[AnchorOverlay],
+) -> list[BoundaryGradientArrow]:
+    """At each anchor, compute −g(c)⁻¹·w (steepest Riemannian descent)."""
+    if not anchors:
+        return []
+    weights = axis_weights(policy)
+    axes = list(metric.sub_condition_ids) or [
+        s.id for s in policy.rubric.sub_conditions
+    ]
+    if not axes:
+        return []
+    weights_vec = np.asarray(
+        [weights.get(a, 0.0) for a in axes], dtype=np.float64
+    )
+    if not np.any(weights_vec):
+        return []
+    out: list[BoundaryGradientArrow] = []
+    for a in anchors:
+        try:
+            dual = boundary_gradient_contravariant(
+                metric,
+                np.asarray(a.c_full, dtype=np.float64),
+                weights_vec=weights_vec,
+            )
+        except (np.linalg.LinAlgError, ValueError):
+            continue
+        descent = -dual
+        norm = float(np.linalg.norm(descent))
+        if norm < 1e-9:
+            continue
+        unit = descent / norm
+        out.append(
+            BoundaryGradientArrow(
+                anchor_id=a.anchor_id,
+                cx=a.cx,
+                cy=a.cy,
+                dx=float(unit[axis_i]),
+                dy=float(unit[axis_j]),
+                full_descent=tuple(float(v) for v in descent.tolist()),
+            )
+        )
+    return out
+
+
+def _build_perturbation_arrows(
+    metric: RiemannianMetric,
+    policy: Policy,
+    axis_i: int,
+    axis_j: int,
+    anchors: list[AnchorOverlay],
+    *,
+    max_per_anchor: int = 6,
+) -> list[PerturbationArrow]:
+    """Project each anchor's Jacobian rows onto the chosen axis pair.
+
+    Up to `max_per_anchor` rows per anchor (the most-impactful by
+    |-Δ·w|) so the heatmap doesn't drown in arrows.
+    """
+    if not anchors:
+        return []
+    weights = axis_weights(policy)
+    axes = list(metric.sub_condition_ids) or [
+        s.id for s in policy.rubric.sub_conditions
+    ]
+    if not axes:
+        return []
+    weights_vec = np.asarray(
+        [weights.get(a, 0.0) for a in axes], dtype=np.float64
+    )
+    jacs = all_jacobians()
+    out: list[PerturbationArrow] = []
+    for a in anchors:
+        jac = jacs.get(a.anchor_id)
+        if jac is None or not jac.rows:
+            continue
+        scored: list[tuple[float, object, np.ndarray]] = []
+        for row in jac.rows:
+            delta = np.asarray(
+                [row.deltas.get(ax, 0.0) for ax in axes], dtype=np.float64
+            )
+            if not np.any(delta):
+                continue
+            alignment = float(-(delta @ weights_vec))
+            scored.append((abs(alignment), row, delta))
+        scored.sort(key=lambda kv: -kv[0])
+        for _abs_align, row, delta in scored[:max_per_anchor]:
+            out.append(
+                PerturbationArrow(
+                    anchor_id=a.anchor_id,
+                    perturbation_kind=row.perturbation_kind,  # type: ignore[attr-defined]
+                    transform_label=row.transform_label,  # type: ignore[attr-defined]
+                    cx=a.cx,
+                    cy=a.cy,
+                    dx=float(delta[axis_i]),
+                    dy=float(delta[axis_j]),
+                    full_delta=tuple(float(v) for v in delta.tolist()),
+                )
+            )
+    return out
+
+
+def _build_perturbation_efficiency(
+    metric: RiemannianMetric,
+    policy: Policy,
+    anchor_id: str,
+) -> list[PerturbationEfficiencyEntry]:
+    """Per-row boundary-closure efficiency at one anchor; ranked descending."""
+    weights = axis_weights(policy)
+    axes = list(metric.sub_condition_ids) or [
+        s.id for s in policy.rubric.sub_conditions
+    ]
+    if not axes:
+        return []
+    weights_vec = np.asarray(
+        [weights.get(a, 0.0) for a in axes], dtype=np.float64
+    )
+    jac = all_jacobians().get(anchor_id)
+    if jac is None or not jac.rows:
+        return []
+    c_anchor = np.asarray(
+        [jac.baseline_per_sub_condition.get(a, 0.0) for a in axes],
+        dtype=np.float64,
+    )
+    out: list[PerturbationEfficiencyEntry] = []
+    for row in jac.rows:
+        delta = np.asarray(
+            [row.deltas.get(a, 0.0) for a in axes], dtype=np.float64
+        )
+        if not np.any(delta):
+            continue
+        try:
+            eff, alignment, riem_norm = perturbation_efficiency(
+                metric=metric,
+                c_anchor=c_anchor,
+                delta=delta,
+                weights_vec=weights_vec,
+            )
+        except (np.linalg.LinAlgError, ValueError):
+            continue
+        out.append(
+            PerturbationEfficiencyEntry(
+                anchor_id=anchor_id,
+                perturbation_kind=row.perturbation_kind,
+                transform_label=row.transform_label,
+                efficiency=eff,
+                boundary_alignment=alignment,
+                riem_norm=riem_norm,
+            )
+        )
+    out.sort(key=lambda e: e.efficiency, reverse=True)
+    return out
+
+
+def _add_arrow_overlays(
+    fig: go.Figure,
+    *,
+    boundary_arrows: list[BoundaryGradientArrow],
+    perturbation_arrows: list[PerturbationArrow],
+    arrow_scale: float,
+) -> None:
+    """Append the boundary-gradient and Jacobian-quiver layers to `fig`."""
+    kind_colors = {
+        "authority": "red",
+        "boundary": "darkorange",
+        "demographic": "purple",
+        "ethnicity": "magenta",
+        "profession": "saddlebrown",
+        "paraphrase": "teal",
+    }
+    if perturbation_arrows:
+        for kind in sorted({a.perturbation_kind for a in perturbation_arrows}):
+            color = kind_colors.get(kind, "grey")
+            arrows = [a for a in perturbation_arrows if a.perturbation_kind == kind]
+            xs: list[float | None] = []
+            ys: list[float | None] = []
+            for ar in arrows:
+                vx = ar.dx
+                vy = ar.dy
+                norm = float(np.hypot(vx, vy))
+                if norm < 1e-12:
+                    continue
+                clip = arrow_scale * min(1.0, norm * 4.0)
+                ex = ar.cx + (vx / norm) * clip
+                ey = ar.cy + (vy / norm) * clip
+                xs.extend([ar.cx, ex, None])
+                ys.extend([ar.cy, ey, None])
+            if not xs:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=xs,
+                    y=ys,
+                    mode="lines",
+                    name=f"perturb: {kind}",
+                    line=dict(color=color, width=1.5),
+                    hoverinfo="skip",
+                    showlegend=True,
+                )
+            )
+    if boundary_arrows:
+        xs2: list[float | None] = []
+        ys2: list[float | None] = []
+        for ar in boundary_arrows:
+            vx = ar.dx
+            vy = ar.dy
+            norm = float(np.hypot(vx, vy))
+            if norm < 1e-12:
+                continue
+            ex = ar.cx + (vx / norm) * arrow_scale
+            ey = ar.cy + (vy / norm) * arrow_scale
+            xs2.extend([ar.cx, ex, None])
+            ys2.extend([ar.cy, ey, None])
+        if xs2:
+            fig.add_trace(
+                go.Scatter(
+                    x=xs2,
+                    y=ys2,
+                    mode="lines",
+                    name="−g⁻¹·w (Riemannian descent)",
+                    line=dict(color="black", width=3),
+                    hoverinfo="skip",
+                    showlegend=True,
+                )
+            )
+
+
+def _render_perturbation_efficiency(
+    metric: RiemannianMetric,
+    policy: Policy,
+) -> None:
+    """Anchor selectbox + horizontal bar chart of boundary-closure efficiency."""
+    jacs = all_jacobians()
+    if not jacs:
+        st.info(
+            "No anchor Jacobians yet — run `maimonedes perturb --all-anchors` "
+            "to populate the perturbation cloud, then this chart ranks "
+            "which perturbations break compliance fastest at each anchor."
+        )
+        return
+
+    st.subheader("Boundary-closure efficiency (ranked perturbations)")
+    st.markdown(
+        "For each perturbation type *j* applied at the selected anchor, "
+        "computes `efficiency = -Δ_j · w / ‖Δ_j‖_g(c)`. Higher = more "
+        "compliance erosion per unit Riemannian step, in the FULL k-dim "
+        "metric (no 2D-slice loss). Ranked top-to-bottom."
+    )
+
+    anchor_ids = sorted(jacs.keys())
+    selected = st.selectbox(
+        "Anchor", options=anchor_ids, index=0, key="perturb_eff_anchor"
+    )
+    entries = _build_perturbation_efficiency(metric, policy, selected)
+    if not entries:
+        st.info(f"No usable Jacobian rows for anchor {selected!r}.")
+        return
+
+    top_n = st.slider(
+        "Show top N",
+        min_value=5,
+        max_value=min(50, len(entries)),
+        value=min(15, len(entries)),
+        step=1,
+        key="perturb_eff_top_n",
+    )
+    top_entries = entries[:top_n]
+
+    labels = [
+        f"{e.transform_label}  ({e.perturbation_kind})" for e in top_entries
+    ]
+    effs = [e.efficiency for e in top_entries]
+    norms = [e.riem_norm for e in top_entries]
+    aligns = [e.boundary_alignment for e in top_entries]
+
+    bar_fig = go.Figure()
+    bar_fig.add_trace(
+        go.Bar(
+            x=effs,
+            y=labels,
+            orientation="h",
+            marker=dict(
+                color=effs,
+                colorscale="RdBu_r",
+                cmin=-max(abs(e) for e in effs) if effs else 0.0,
+                cmax=max(abs(e) for e in effs) if effs else 1.0,
+                colorbar=dict(title="efficiency"),
+            ),
+            customdata=list(zip(norms, aligns)),
+            hovertemplate=(
+                "%{y}<br>efficiency=%{x:.4f}<br>"
+                "‖Δ‖_g=%{customdata[0]:.4f}<br>"
+                "-Δ·w=%{customdata[1]:.4f}<extra></extra>"
+            ),
+        )
+    )
+    bar_fig.update_layout(
+        xaxis_title="boundary-closure efficiency",
+        yaxis=dict(autorange="reversed"),
+        height=max(360, 30 * len(top_entries) + 80),
+        margin=dict(l=40, r=40, t=20, b=40),
+    )
+    st.plotly_chart(bar_fig, use_container_width=True)
+    st.caption(
+        f"Anchor {selected!r}: top {len(top_entries)} of {len(entries)} "
+        f"perturbation rows. Red bars = high efficiency (the model's "
+        f"weak directions); blue = lower efficiency (Riemannian-"
+        f"expensive or boundary-misaligned). The full k-dim metric is "
+        f"used — these numbers don't depend on the 2D slice above."
     )
 
 

@@ -128,6 +128,60 @@ class RadialCloudPoint:
 
 
 @dataclass
+class PerturbationArrow:
+    """One Jacobian-row delta projected onto the chosen 2D axis pair.
+
+    `(cx, cy)` is the arrow tail (anchor's projected position);
+    `(dx, dy)` is the arrow vector (Δ projected onto the same plane).
+    `full_delta` carries the unprojected k-vector for hover-text and
+    for the bar-chart computation that uses the full-dim metric norm.
+    """
+
+    anchor_id: str
+    perturbation_kind: str
+    transform_label: str
+    cx: float
+    cy: float
+    dx: float
+    dy: float
+    full_delta: tuple[float, ...]
+
+
+@dataclass
+class BoundaryGradientArrow:
+    """Riemannian (contravariant) gradient of the margin at one anchor.
+
+    The arrow points toward fastest *increase* of the margin (away from
+    the boundary). Negate to get steepest descent. Direction in 2D is
+    the projection of −g(c)⁻¹·w onto the chosen axis pair.
+    """
+
+    anchor_id: str
+    cx: float
+    cy: float
+    dx: float
+    dy: float
+    full_descent: tuple[float, ...]
+
+
+@dataclass
+class PerturbationEfficiencyEntry:
+    """One ranked row of the per-anchor boundary-closure efficiency chart.
+
+    `efficiency = -Δ·w / ‖Δ‖_g` (higher = more compliance erosion per
+    unit Riemannian step). `riem_norm` is the denominator,
+    `boundary_alignment` is the numerator before normalisation.
+    """
+
+    anchor_id: str
+    perturbation_kind: str
+    transform_label: str
+    efficiency: float
+    boundary_alignment: float
+    riem_norm: float
+
+
+@dataclass
 class RadialCloudSnapshot:
     """Star-coordinate scatter cloud + radial axis labels.
 
@@ -150,10 +204,13 @@ class RadialCloudSnapshot:
 
 __all__ = [
     "AnchorOverlay",
+    "BoundaryGradientArrow",
     "DistanceComparison",
     "GridSnapshot",
     "MetricEllipse",
     "MetricFitSnapshot",
+    "PerturbationArrow",
+    "PerturbationEfficiencyEntry",
     "PresetSegment",
     "RadialCloudPoint",
     "RadialCloudSnapshot",

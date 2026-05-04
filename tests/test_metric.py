@@ -28,12 +28,14 @@ from maimonedes.monitor.metric import (
     _build_lower_triangular,
     _build_lower_triangular_grad,
     _frobenius_loss_and_grad,
+    boundary_gradient_contravariant,
     compute_radial_projection_cloud,
     compute_ratio_surface,
     euclidean_distance,
     fit_metric,
     fit_metric_from_pairs,
     metric_at,
+    perturbation_efficiency,
     riemannian_distance,
     worst_fragility_axis_pair,
 )
@@ -701,6 +703,105 @@ def test_compute_radial_projection_cloud_includes_anchors_when_requested(db: str
     # finiteness of x/y as a smoke test.
     for x, y, _z, _c, _is_a in flagged:
         assert np.isfinite(x) and np.isfinite(y)
+
+
+def test_boundary_gradient_matches_g_inv_w_on_identity_metric() -> None:
+    """For an identity metric, g⁻¹·w = w. Sanity-check the closed form."""
+    metric = _make_radial_metric()
+    # The radial fixture isn't identity, but at the deep interior where
+    # the scale factor is 1, g(c) ≈ I, and g⁻¹·w ≈ w. Check that the
+    # contravariant gradient direction at a deep-interior point aligns
+    # with w (cosine ≈ 1).
+    c = np.array([0.95, 0.95])  # deep interior
+    weights_vec = np.array([0.5, 0.5])
+    dual = boundary_gradient_contravariant(metric, c, weights_vec=weights_vec)
+    cosine = float(
+        np.dot(dual, weights_vec)
+        / (np.linalg.norm(dual) * np.linalg.norm(weights_vec))
+    )
+    # Threshold loose enough to absorb the radial-fixture's training
+    # noise (the fit's g(c) at the deep interior is close to but not
+    # exactly identity).
+    assert cosine > 0.9
+
+
+def test_boundary_gradient_at_stretched_region_differs_from_w() -> None:
+    """Near the boundary the metric is anisotropic (radial fixture has
+    high scale there); the contravariant gradient should rotate / shrink."""
+    metric = _make_radial_metric()
+    weights_vec = np.array([0.5, 0.5])
+    c_safe = np.array([0.95, 0.95])
+    c_near = np.array([0.55, 0.55])  # near-boundary
+    dual_safe = boundary_gradient_contravariant(
+        metric, c_safe, weights_vec=weights_vec
+    )
+    dual_near = boundary_gradient_contravariant(
+        metric, c_near, weights_vec=weights_vec
+    )
+    # Magnitudes should differ — the stretched metric has smaller g⁻¹·w
+    # in the stretched directions.
+    assert float(np.linalg.norm(dual_safe)) != pytest.approx(
+        float(np.linalg.norm(dual_near)), rel=1e-2
+    )
+
+
+def test_perturbation_efficiency_higher_when_aligned_with_neg_w() -> None:
+    """A Δ that points opposite-w (toward the boundary) ranks above a Δ
+    that points along w (away). Same Riemannian magnitude, different
+    boundary alignment → different efficiency score."""
+    metric = _make_radial_metric()
+    weights_vec = np.array([0.5, 0.5])
+    c = np.array([0.7, 0.7])
+    delta_toward = np.array([-0.1, -0.1])  # both axes drop = boundary-bound
+    delta_away = np.array([0.1, 0.1])  # both axes rise = stable-bound
+
+    eff_toward, _, _ = perturbation_efficiency(
+        metric=metric,
+        c_anchor=c,
+        delta=delta_toward,
+        weights_vec=weights_vec,
+    )
+    eff_away, _, _ = perturbation_efficiency(
+        metric=metric,
+        c_anchor=c,
+        delta=delta_away,
+        weights_vec=weights_vec,
+    )
+    # toward should be positive (efficient at boundary closure), away
+    # should be negative (anti-efficient).
+    assert eff_toward > 0 > eff_away
+    assert eff_toward == pytest.approx(-eff_away, abs=1e-9)
+
+
+def test_perturbation_efficiency_orthogonal_to_w_is_zero() -> None:
+    """A Δ perpendicular to w has zero alignment → zero efficiency."""
+    metric = _make_radial_metric()
+    # k=2 weights = (0.5, 0.5); perpendicular vector is (1, -1).
+    weights_vec = np.array([0.5, 0.5])
+    c = np.array([0.7, 0.7])
+    delta_perp = np.array([0.1, -0.1])
+    eff, alignment, riem_norm = perturbation_efficiency(
+        metric=metric,
+        c_anchor=c,
+        delta=delta_perp,
+        weights_vec=weights_vec,
+    )
+    assert alignment == pytest.approx(0.0, abs=1e-12)
+    assert eff == pytest.approx(0.0, abs=1e-12)
+    assert riem_norm > 0  # Δ itself is non-zero
+
+
+def test_perturbation_efficiency_zero_delta_returns_zeros() -> None:
+    metric = _make_radial_metric()
+    eff, alignment, riem_norm = perturbation_efficiency(
+        metric=metric,
+        c_anchor=np.array([0.7, 0.7]),
+        delta=np.zeros(2),
+        weights_vec=np.array([0.5, 0.5]),
+    )
+    assert eff == 0.0
+    assert alignment == pytest.approx(0.0)
+    assert riem_norm == pytest.approx(0.0)
 
 
 def test_compute_radial_projection_cloud_validates_args() -> None:

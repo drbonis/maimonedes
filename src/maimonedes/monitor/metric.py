@@ -973,6 +973,56 @@ def compute_radial_projection_cloud(
     }
 
 
+def boundary_gradient_contravariant(
+    metric: RiemannianMetric,
+    c: np.ndarray,
+    *,
+    weights_vec: np.ndarray,
+) -> np.ndarray:
+    """Contravariant (raised) gradient of `s(c) = w·c` under the metric.
+
+    For a linear-aggregate policy the covariant gradient ∇s = w is constant.
+    The contravariant gradient `g(c)⁻¹ · w` is what you'd integrate to
+    "move along s", accounting for the local metric. The MOST EFFICIENT
+    direction toward the boundary is `−g(c)⁻¹ · w` (negate to descend s).
+    """
+    g = metric_at(metric, c)
+    g_inv = np.linalg.inv(g)
+    return g_inv @ np.asarray(weights_vec, dtype=np.float64)
+
+
+def perturbation_efficiency(
+    *,
+    metric: RiemannianMetric,
+    c_anchor: np.ndarray,
+    delta: np.ndarray,
+    weights_vec: np.ndarray,
+) -> tuple[float, float, float]:
+    """Boundary-closure efficiency of a perturbation Δ at anchor `c`.
+
+    Returns `(efficiency, boundary_alignment, riem_norm)` where
+        efficiency       = -Δ · w / √(Δᵀ g(c) Δ)
+        boundary_alignment = -Δ · w  (raw dot with negative gradient)
+        riem_norm        = √(Δᵀ g(c) Δ)  (Riemannian length of Δ at c)
+
+    Higher `efficiency` = more compliance erosion per unit Riemannian step.
+    Note the metric "cancels out" in the inner product when one operand is
+    the contravariant gradient: `⟨Δ, g⁻¹ w⟩_g = Δᵀ g g⁻¹ w = Δᵀ w`.
+    The Riemannian norm of Δ stays in the denominator so directions that
+    are "Riemannian-cheap" but happen to align poorly with the boundary
+    rank below directions that align well even at higher Riemannian cost.
+    """
+    g = metric_at(metric, c_anchor)
+    delta_arr = np.asarray(delta, dtype=np.float64)
+    weights_arr = np.asarray(weights_vec, dtype=np.float64)
+    riem_sq = float(delta_arr @ g @ delta_arr)
+    riem_norm = float(np.sqrt(max(riem_sq, 0.0)))
+    alignment = float(-(delta_arr @ weights_arr))
+    if riem_norm < 1e-9:
+        return 0.0, alignment, riem_norm
+    return alignment / riem_norm, alignment, riem_norm
+
+
 def worst_fragility_axis_pair(
     *,
     sub_condition_ids: tuple[str, ...] | list[str],
@@ -1019,12 +1069,14 @@ def position_vector(score_per_sub: dict[str, float], axes: Iterable[str]) -> np.
 __all__ = [
     "MetricMLP",
     "RiemannianMetric",
+    "boundary_gradient_contravariant",
     "compute_radial_projection_cloud",
     "compute_ratio_surface",
     "euclidean_distance",
     "fit_metric",
     "fit_metric_from_pairs",
     "metric_at",
+    "perturbation_efficiency",
     "position_vector",
     "riemannian_distance",
     "worst_fragility_axis_pair",
