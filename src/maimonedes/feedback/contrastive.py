@@ -21,6 +21,7 @@ this list as the "dominant gradient direction" hint.
 from __future__ import annotations
 
 import logging
+from datetime import timezone
 
 from sqlalchemy import select
 
@@ -37,7 +38,10 @@ from maimonedes.storage.drift import (
     list_drift_sessions,
     scores_for_run,
 )
-from maimonedes.storage.llm_calls import LLMCall
+from maimonedes.storage.llm_calls import (
+    SUPERVISED_TO_SCORE_MAX_SECONDS,
+    LLMCall,
+)
 from maimonedes.storage.perturbations import PerturbationProbeRow
 from maimonedes.storage.repo import get_session
 
@@ -45,20 +49,55 @@ from maimonedes.storage.repo import get_session
 log = logging.getLogger(__name__)
 
 MISSING_TEXT = "<text not recorded>"
+SUPERVISED_BACKEND_PREFIX = "ollama-supervised"
 
 
-def _llm_response_text(llm_call_id: int | None) -> str:
-    """Recover the supervised system's response text by `llm_call_id`.
+def _llm_response_text(score: ComplianceScore) -> str:
+    """Recover the supervised system's response text for a score.
 
-    Legacy rows or rows where the call wasn't persisted return
-    `MISSING_TEXT` so the rest of the pair stays valid; the synthesizer
-    can still use the scalar scores as evidence.
+    Two paths, in order:
+    1. **FK path.** If `score.llm_call_id` is set and the row exists,
+       return its `response_content` — the precise call that produced
+       the scored output.
+    2. **Chronological fallback.** Legacy rows (created before #44 wired
+       the FK) lack `llm_call_id`. Pair them with the most-recent
+       supervised LLMCall whose timestamp is at or before
+       `score.scored_at`, within `SUPERVISED_TO_SCORE_MAX_SECONDS`.
+       This mirrors the heuristic in `pair_supervised_with_scores` so
+       the dashboard surfaces real text without requiring an explicit
+       `backfill-llm-call-ids` run.
+
+    Returns `MISSING_TEXT` only when neither path resolves a row (e.g.
+    a test fixture with no supervised calls at all, or a score whose
+    nearest call is outside the staleness window).
     """
-    if llm_call_id is None:
-        return MISSING_TEXT
+    if score.llm_call_id is not None:
+        with get_session() as session:
+            row = session.get(LLMCall, score.llm_call_id)
+            if row is not None:
+                return row.response_content
+
+    scored_at = score.scored_at
+    if scored_at.tzinfo is None:
+        scored_at = scored_at.replace(tzinfo=timezone.utc)
     with get_session() as session:
-        row = session.get(LLMCall, llm_call_id)
-        return row.response_content if row is not None else MISSING_TEXT
+        row = session.execute(
+            select(LLMCall)
+            .where(
+                LLMCall.backend_name.like(f"{SUPERVISED_BACKEND_PREFIX}%"),
+                LLMCall.timestamp <= scored_at,
+            )
+            .order_by(LLMCall.timestamp.desc(), LLMCall.id.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if row is None:
+            return MISSING_TEXT
+        ts = row.timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if (scored_at - ts).total_seconds() > SUPERVISED_TO_SCORE_MAX_SECONDS:
+            return MISSING_TEXT
+        return row.response_content
 
 
 def _dropoff_axes(safe: ComplianceScore, near: ComplianceScore) -> list[str]:
@@ -138,9 +177,9 @@ def temporal_pair(
     return ContrastivePair(
         anchor_id=anchor_id,
         kind="temporal",
-        safe_text=_llm_response_text(safe.llm_call_id),
+        safe_text=_llm_response_text(safe),
         safe_score=safe,
-        near_boundary_text=_llm_response_text(near.llm_call_id),
+        near_boundary_text=_llm_response_text(near),
         near_boundary_score=near,
         dropoff_axes=_dropoff_axes(safe, near),
     )
@@ -199,9 +238,9 @@ def fragility_pair(
     return ContrastivePair(
         anchor_id=anchor_id,
         kind="fragility",
-        safe_text=_llm_response_text(safe.llm_call_id),
+        safe_text=_llm_response_text(safe),
         safe_score=safe,
-        near_boundary_text=_llm_response_text(near.llm_call_id),
+        near_boundary_text=_llm_response_text(near),
         near_boundary_score=near,
         dropoff_axes=_dropoff_axes(safe, near),
     )

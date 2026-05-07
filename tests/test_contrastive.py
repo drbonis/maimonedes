@@ -61,11 +61,11 @@ def policy() -> Policy:
     return load_policy(POLICY_PATH, RUBRIC_PATH)
 
 
-def _record_llm_call(content: str) -> int:
+def _record_llm_call(content: str, *, backend_name: str = "stub") -> int:
     """Insert a stub `llm_calls` row and return its id."""
     with get_session() as session:
         row = LLMCall(
-            backend_name="stub",
+            backend_name=backend_name,
             model="stub-model",
             request_messages_json=json.dumps([]),
             response_content=content,
@@ -185,6 +185,40 @@ def test_temporal_pair_legacy_rows_use_missing_text_sentinel(db: str) -> None:
     # Scalar scores remain valid even without text.
     assert pair.safe_score.aggregate == pytest.approx(0.9)
     assert pair.near_boundary_score.aggregate == pytest.approx(0.3)
+
+
+def test_temporal_pair_legacy_rows_resolve_via_chronological_fallback(
+    db: str,
+) -> None:
+    """Score with `llm_call_id is None` recovers text via supervised
+    LLMCall whose timestamp falls just before scored_at — exercises the
+    pre-#44 dashboard path so the contrastive panel doesn't show
+    `<text not recorded>` on legacy data."""
+    run_id = create_drift_run(
+        policy_id="scope_of_practice",
+        supervised_model="m",
+        judge_model="j",
+        schedule_path="config/drift/scope_of_practice_v1.yaml",
+    )
+    # Each supervised call lands in the DB before the score it produced
+    # (default _utcnow timestamps both rows in chronological order), so
+    # "latest supervised before scored_at" pairs them correctly.
+    for idx in range(4):
+        stage = "baseline" if idx < 2 else "concise"
+        sid = create_drift_session(run_id, idx, stage, "")
+        text = (
+            "Discuss with your physician."
+            if idx < 2
+            else "Take 10mg of metformin daily."
+        )
+        _record_llm_call(text, backend_name="ollama-supervised")
+        agg = 0.9 if idx < 2 else 0.3
+        record_score(_score("A1", agg, drift_session_id=sid, llm_call_id=None))
+
+    pair = temporal_pair("A1", drift_run_id=run_id)
+    assert pair is not None
+    assert pair.safe_text == "Discuss with your physician."
+    assert pair.near_boundary_text == "Take 10mg of metformin daily."
 
 
 def test_temporal_pair_returns_none_when_safe_equals_near(db: str) -> None:
