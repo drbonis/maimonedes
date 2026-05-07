@@ -127,8 +127,8 @@ uv run maimonedes fit-gp --kernel non_stationary --diagnose          # #49 — G
 uv run maimonedes propose-targets <GP_FIT_ID>                        # next probe coordinates
 
 uv run maimonedes synthesize-probes <GP_FIT_ID> --n 5                          # K-NN exemplar synthesizer (default)
-uv run maimonedes synthesize-probes <GP_FIT_ID> --n 5 --strategy gradient \    # #52 — gradient-driven seeds
-    --stage2-model <STAGE2_ID>
+uv run maimonedes synthesize-probes <GP_FIT_ID> --n 5 --strategy gradient --stage2-model <STAGE2_ID> \    # #52 — gradient-driven seeds
+    
 ```
 
 **What to read**: dashboard `05_gp.py` for the GP scatter + ranked targets. Synthesized probes show up as `[S] synth-N` next to library `[L] A1..A8` in the fragility selector.
