@@ -147,8 +147,7 @@ The fitting routine accepts a kernel-selector argument with at least three value
 - **`riemannian_pullback`** — instantiates a metric-warped kernel that consumes the compliance-space metric tensor field of Component 600 by routing input embeddings through the Stage-2 compliance scorer of Component 222 and applying the metric in score space. For embeddings `e_1`, `e_2` with predicted score vectors `c_i = f(e_i)` and score-space midpoint `m_c = (c_1 + c_2) / 2`, the kernel is
 
   ```
-  k(e_1, e_2) = σ² · exp(−½ · (c_1 − c_2)^T · g(m_c) · (c_1 − c_2) / ℓ²)
-              + ε · exp(−½ · ‖e_1 − e_2‖² / ℓ_E²)
+  k(e_1, e_2) = σ² · exp(−½ · (c_1 − c_2)^T · g(m_c) · (c_1 − c_2) / ℓ²) + ε · exp(−½ · ‖e_1 − e_2‖² / ℓ_E²)
   ```
 
   where `g(m_c)` is the local metric tensor produced by Component 620 evaluated at `m_c`, the first term is a Mahalanobis-form kernel applied to the score-space images of `f` (positive-semidefinite by construction), and the second `ε · k_RBF` term (`ε ≪ σ²`) is a small isotropic embedding-space tiebreaker rendering the composite kernel positive-definite even when distinct embeddings collapse to identical score vectors under `f`. The GP posterior trained under this kernel inherits the fragility geometry of compliance-score space, so that the candidate-target proposer of §4.5.5 ranks more highly those embeddings whose score predictions place them in high-curvature regions of the boundary, where small perturbations produce disproportionate compliance changes. An alternative embodiment uses a local Jacobian-based embedding-space pullback `g_E(e) = J_f(e)^T · g(f(e)) · J_f(e) + ε · I`, with `J_f` computed by the same central-differences finite-differencing routine used by Component 730, applying `g_E(m)` at the embedding-space midpoint `m = (e_1 + e_2)/2`. Both forms eliminate any requirement for backprop access to the Stage-2 head and are agnostic to the head's function-approximator family.

@@ -26,6 +26,8 @@ from sklearn.preprocessing import StandardScaler
 
 from maimonedes.core.policy import Policy
 from maimonedes.llm.embed_client import EmbedClient
+from maimonedes.models.stage2 import Stage2Model
+from maimonedes.monitor.metric import RiemannianMetric
 from maimonedes.storage.llm_calls import pair_supervised_with_scores
 
 
@@ -67,6 +69,11 @@ class ComplianceGP:
     # Default-empty for backward compat with pre-existing pickled artefacts.
     training_texts: list[str] = field(default_factory=list)
     library_anchor_texts: dict[str, str] = field(default_factory=dict)
+    # Issue #62: kernel-kind tag + FK-style reference to the consumed
+    # metric_fits row (riemannian_pullback only). Defaults keep older
+    # pickles loadable.
+    kernel_kind: str = "stationary"
+    metric_fit_id: int | None = None
 
     def _to_gp_space(self, embeddings: np.ndarray) -> np.ndarray:
         """Apply scaler → optional PCA so the GP sees its native space."""
@@ -271,6 +278,246 @@ def non_stationary_kernel(
     return GibbsKernel(sigma=sigma, a=a, b=b, c=c)
 
 
+# ---- Riemannian-pullback kernel (issue #62, §4.5.3, §6.8) ------------------
+#
+# A metric-warped kernel that consumes the compliance-space metric tensor
+# field of Component 600 by routing input embeddings through the Stage-2
+# compliance scorer and applying the metric in score space:
+#
+#   c_i = f(e_i)                                 (Stage-2 score-space image)
+#   m_c = (c_i + c_j) / 2                        (score-space midpoint)
+#   k(e_i, e_j) = σ² · exp(−½ · (c_i − c_j)ᵀ · g(m_c) · (c_i − c_j) / ℓ²)
+#                + ε · exp(−½ · ‖e_i − e_j‖² / ℓ_E²)
+#
+# The Mahalanobis-form first term is symmetric and PSD on its diagonal
+# (quadratic form in a PD matrix), but the position-dependent g(m_c)
+# means the *full* Gram matrix is not strictly PD by construction.
+# The second term `ε · k_RBF` (`ε ≪ σ²`) is a small isotropic embedding-
+# space tiebreaker that regularizes the spectrum and keeps the composite
+# kernel positive-definite even when distinct embeddings collapse to
+# identical score-space images under f. With the GP's `alpha · I`
+# observation noise on top, a small ε is sufficient in practice.
+#
+# Two operational modes share the same dataclass:
+# - `mode="score"`     applies g in score space, requires only Stage-2's
+#                      `predict()` and the metric MLP. Cost is
+#                      `O(N² · k³)` (one metric eval per pair).
+# - `mode="jacobian"`  pulls g back to embedding space pointwise as
+#                      `g_E(e) = J_f(e)ᵀ g(f(e)) J_f(e) + fd_eps · I`,
+#                      computing J_f via central-differences. Cost is
+#                      `O(N² · d)` extra forward passes (one per pair
+#                      midpoint), independent of head family.
+#
+# Hyperparameters (σ, ℓ, ε, ℓ_E) are fixed externally — the kernel
+# does not expose them via sklearn's `Hyperparameter` protocol and
+# raises `NotImplementedError` on `eval_gradient=True`. Use
+# `optimizer=None` on the wrapping `GaussianProcessRegressor`.
+
+
+class RiemannianPullbackKernel(Kernel):
+    """Score-space Mahalanobis warp + ε embedding-RBF tiebreaker.
+
+    See module-level explanation. `stage2_model` provides per-axis
+    `f(e)` via its `heads[axis_id].predict()` Pipeline; `metric` is a
+    fitted `RiemannianMetric` whose `model.predict_g(c)` returns the
+    local PD metric tensor at score-space coordinate `c`.
+    `sub_condition_axes` fixes the axis order both maps share.
+    """
+
+    def __init__(
+        self,
+        *,
+        stage2_model: Stage2Model,
+        metric: RiemannianMetric,
+        sub_condition_axes: tuple[str, ...],
+        sigma: float = 1.0,
+        length_scale: float = 1.0,
+        epsilon: float = 1e-3,
+        embedding_length_scale: float = 1.0,
+        mode: str = "score",
+        fd_eps: float = 1e-3,
+    ) -> None:
+        if mode not in {"score", "jacobian"}:
+            raise ValueError(
+                f"unknown mode {mode!r}; expected 'score' or 'jacobian'"
+            )
+        if not sub_condition_axes:
+            raise ValueError("sub_condition_axes must be non-empty")
+        for axis_id in sub_condition_axes:
+            if axis_id not in stage2_model.heads:
+                raise ValueError(
+                    f"axis {axis_id!r} not in stage2_model.heads "
+                    f"(available: {sorted(stage2_model.heads.keys())})"
+                )
+        if metric.k != len(sub_condition_axes):
+            raise ValueError(
+                f"metric.k={metric.k} does not match "
+                f"len(sub_condition_axes)={len(sub_condition_axes)}"
+            )
+        self.stage2_model = stage2_model
+        self.metric = metric
+        self.sub_condition_axes = tuple(sub_condition_axes)
+        self.sigma = float(sigma)
+        self.length_scale = float(length_scale)
+        self.epsilon = float(epsilon)
+        self.embedding_length_scale = float(embedding_length_scale)
+        self.mode = mode
+        self.fd_eps = float(fd_eps)
+
+    # ---- sklearn protocol ---------------------------------------------------
+
+    def is_stationary(self) -> bool:
+        return False
+
+    def __call__(
+        self,
+        X: np.ndarray,
+        Y: np.ndarray | None = None,
+        eval_gradient: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+        if eval_gradient:
+            raise NotImplementedError(
+                "RiemannianPullbackKernel hyperparameters are externally "
+                "fixed; instantiate GaussianProcessRegressor with "
+                "optimizer=None so sklearn doesn't request kernel gradients."
+            )
+        X_arr = np.asarray(X, dtype=float)
+        sym = Y is None
+        Y_arr = X_arr if sym else np.asarray(Y, dtype=float)
+        if self.mode == "score":
+            return self._call_score(X_arr, Y_arr)
+        return self._call_jacobian(X_arr, Y_arr)
+
+    def diag(self, X: np.ndarray) -> np.ndarray:
+        # k(e, e): both score-space and embedding-space deltas are zero,
+        # so the value collapses to σ² + ε regardless of mode.
+        n = np.asarray(X).shape[0]
+        return np.full(n, self.sigma ** 2 + self.epsilon, dtype=float)
+
+    def __repr__(self) -> str:
+        return (
+            f"RiemannianPullbackKernel(sigma={self.sigma:.4g}, "
+            f"length_scale={self.length_scale:.4g}, "
+            f"epsilon={self.epsilon:.4g}, "
+            f"embedding_length_scale={self.embedding_length_scale:.4g}, "
+            f"mode={self.mode!r}, k={self.metric.k})"
+        )
+
+    # ---- score-space evaluation --------------------------------------------
+
+    def _score_of(self, X: np.ndarray) -> np.ndarray:
+        """Map raw embeddings to score-space coordinates `(n, k)` via Stage-2."""
+        out = np.empty(
+            (X.shape[0], len(self.sub_condition_axes)), dtype=float
+        )
+        for j, axis_id in enumerate(self.sub_condition_axes):
+            head = self.stage2_model.heads[axis_id]
+            preds = np.asarray(head.predict(X), dtype=float).reshape(-1)
+            out[:, j] = np.clip(preds, 0.0, 1.0)
+        return out
+
+    def _embedding_rbf(self, X: np.ndarray, Y: np.ndarray) -> np.ndarray:
+        Xsq = (X * X).sum(axis=1)
+        Ysq = (Y * Y).sum(axis=1)
+        sqdist = Xsq[:, None] + Ysq[None, :] - 2.0 * (X @ Y.T)
+        np.maximum(sqdist, 0.0, out=sqdist)
+        return np.exp(-0.5 * sqdist / (self.embedding_length_scale ** 2))
+
+    def _call_score(self, X: np.ndarray, Y: np.ndarray) -> np.ndarray:
+        c_X = self._score_of(X)
+        c_Y = c_X if X is Y else self._score_of(Y)
+        n, m = X.shape[0], Y.shape[0]
+        sigma2 = self.sigma ** 2
+        ell2 = self.length_scale ** 2
+        K = np.empty((n, m), dtype=float)
+        for i in range(n):
+            for j in range(m):
+                m_c = 0.5 * (c_X[i] + c_Y[j])
+                g_mid = self.metric.model.predict_g(m_c)
+                delta = c_X[i] - c_Y[j]
+                quad = float(delta @ g_mid @ delta)
+                K[i, j] = sigma2 * np.exp(-0.5 * quad / ell2)
+        K = K + self.epsilon * self._embedding_rbf(X, Y)
+        return K
+
+    # ---- jacobian-pullback evaluation --------------------------------------
+
+    def _jacobian_at(self, e: np.ndarray) -> np.ndarray:
+        """`J_f(e) ∈ ℝ^{k×d}` via two batched central-differences passes."""
+        d = e.shape[0]
+        eye = np.eye(d, dtype=float) * self.fd_eps
+        plus = np.tile(e, (d, 1)) + eye
+        minus = np.tile(e, (d, 1)) - eye
+        c_plus = self._score_of(plus)   # (d, k)
+        c_minus = self._score_of(minus)  # (d, k)
+        # J[a, i] = ∂c_a/∂e_i = (c_plus[i, a] - c_minus[i, a]) / (2·eps)
+        return (c_plus - c_minus).T / (2.0 * self.fd_eps)
+
+    def _call_jacobian(self, X: np.ndarray, Y: np.ndarray) -> np.ndarray:
+        n, m = X.shape[0], Y.shape[0]
+        d = X.shape[1]
+        sigma2 = self.sigma ** 2
+        ell2 = self.length_scale ** 2
+        K = np.empty((n, m), dtype=float)
+        # Cache per-row score-space images so the midpoint metric eval
+        # avoids a third Stage-2 call.
+        c_X = self._score_of(X)
+        c_Y = c_X if X is Y else self._score_of(Y)
+        for i in range(n):
+            for j in range(m):
+                e_mid = 0.5 * (X[i] + Y[j])
+                J = self._jacobian_at(e_mid)
+                c_mid = 0.5 * (c_X[i] + c_Y[j])
+                g_score = self.metric.model.predict_g(c_mid)
+                # g_E = Jᵀ g(f(e)) J + fd_eps · I  (issue #62 spec)
+                g_E = J.T @ g_score @ J + self.fd_eps * np.eye(d, dtype=float)
+                delta = X[i] - Y[j]
+                quad = float(delta @ g_E @ delta)
+                K[i, j] = sigma2 * np.exp(-0.5 * quad / ell2)
+        K = K + self.epsilon * self._embedding_rbf(X, Y)
+        return K
+
+
+def riemannian_pullback_kernel(
+    *,
+    stage2_model: Stage2Model,
+    metric: RiemannianMetric,
+    sub_condition_axes: tuple[str, ...] | None = None,
+    sigma: float = 1.0,
+    length_scale: float = 1.0,
+    epsilon: float = 1e-3,
+    embedding_length_scale: float = 1.0,
+    mode: str = "score",
+    fd_eps: float = 1e-3,
+) -> Kernel:
+    """Build a `RiemannianPullbackKernel` with sensible default axis ordering.
+
+    `sub_condition_axes` defaults to `metric.sub_condition_ids` when not
+    supplied (the order the metric was fitted under). Hyperparameters
+    `(σ, ℓ, ε, ℓ_E)` are fixed externally — wire this kernel through
+    `fit_compliance_gp(..., kernel=<instance>)` or
+    `fit_compliance_gp(..., kernel="riemannian_pullback", stage2_model=...,
+    metric=...)` so sklearn's optimizer is bypassed.
+    """
+    axes = sub_condition_axes or tuple(metric.sub_condition_ids)
+    if not axes:
+        raise ValueError(
+            "sub_condition_axes is empty and metric.sub_condition_ids is "
+            "empty; cannot infer axis order"
+        )
+    return RiemannianPullbackKernel(
+        stage2_model=stage2_model,
+        metric=metric,
+        sub_condition_axes=axes,
+        sigma=sigma,
+        length_scale=length_scale,
+        epsilon=epsilon,
+        embedding_length_scale=embedding_length_scale,
+        mode=mode,
+        fd_eps=fd_eps,
+    )
+
+
 def _gibbs_log_marginal_likelihood(
     theta: np.ndarray,
     X: np.ndarray,
@@ -381,11 +628,20 @@ def _fit_gp_arrays(
     kernel: Kernel | str | None,
     alpha: float = DEFAULT_ALPHA,
     n_restarts_optimizer: int = 5,
+    stage2_model: Stage2Model | None = None,
+    metric: RiemannianMetric | None = None,
+    sub_condition_axes: tuple[str, ...] | None = None,
+    riemannian_kernel_kwargs: dict | None = None,
 ) -> GaussianProcessRegressor:
     """Fit a GP given pre-computed input arrays and a kernel selector.
 
     Split out from `fit_compliance_gp` so tests can drive the kernel
     branching without seeding the database / embed pipeline.
+
+    `kernel="riemannian_pullback"` requires `stage2_model` and `metric`;
+    `sub_condition_axes` defaults to `metric.sub_condition_ids` when
+    omitted. `riemannian_kernel_kwargs` is forwarded to the kernel
+    constructor (σ, ℓ, ε, ℓ_E, mode, fd_eps).
     """
     if isinstance(kernel, str):
         if kernel == "stationary":
@@ -411,11 +667,31 @@ def _fit_gp_arrays(
                 sigma=sigma_opt, a=a_opt, b=b_opt, c=c_opt
             )
             use_external = True
+        elif kernel == "riemannian_pullback":
+            if stage2_model is None or metric is None:
+                raise ValueError(
+                    "kernel='riemannian_pullback' requires both `stage2_model` "
+                    "and `metric` kwargs (issue #62 §4.5.3)"
+                )
+            kernel_obj = riemannian_pullback_kernel(
+                stage2_model=stage2_model,
+                metric=metric,
+                sub_condition_axes=sub_condition_axes,
+                **(riemannian_kernel_kwargs or {}),
+            )
+            use_external = True
         else:
             raise ValueError(
                 f"unknown kernel selector {kernel!r}; "
-                "use 'stationary', 'non_stationary', or a Kernel instance"
+                "use 'stationary', 'non_stationary', "
+                "'riemannian_pullback', or a Kernel instance"
             )
+    elif isinstance(kernel, RiemannianPullbackKernel):
+        kernel_obj = kernel
+        use_external = True
+    elif isinstance(kernel, GibbsKernel):
+        kernel_obj = kernel
+        use_external = True
     elif kernel is None:
         kernel_obj = _default_kernel()
         use_external = False
@@ -446,6 +722,10 @@ def fit_compliance_gp(
     n_restarts_optimizer: int = 5,
     alpha: float = DEFAULT_ALPHA,
     pca_components: int | None = DEFAULT_PCA_COMPONENTS,
+    stage2_model: Stage2Model | None = None,
+    metric: RiemannianMetric | None = None,
+    metric_fit_id: int | None = None,
+    riemannian_kernel_kwargs: dict | None = None,
 ) -> ComplianceGP:
     """Pull (text, aggregate) pairs, embed, fit, return ComplianceGP.
 
@@ -454,11 +734,15 @@ def fit_compliance_gp(
     library-anchor lookups without re-embedding the curated probes.
 
     `kernel` accepts a sklearn `Kernel` instance, the string
-    `"stationary"` (default) for the v1 ConstantKernel*RBF, or
+    `"stationary"` (default) for the v1 ConstantKernel*RBF,
     `"non_stationary"` for the Gibbs kernel from issue #49 — fitted
     via external scipy L-BFGS-B since its hyperparameters are
     real-valued and can't be expressed as positive sklearn
-    hyperparameters.
+    hyperparameters — or `"riemannian_pullback"` for the metric-warped
+    kernel from issue #62 (§4.5.3, §6.8). The riemannian path requires
+    `stage2_model` and `metric` kwargs and bypasses the StandardScaler
+    + PCA preprocessing so raw embeddings flow directly into the
+    kernel (Stage-2 has its own internal scaler).
     """
     points = _fetch_training_points(policy.id)
     if len(points) < min_samples:
@@ -479,34 +763,73 @@ def fit_compliance_gp(
     y = np.asarray(aggregates, dtype=float)
     feature_dim = X.shape[1]
 
-    # Scale features so the kernel's length_scale settles in a finite
-    # range. Without this, raw 768-dim Bio_ClinicalBERT magnitudes
-    # drive the kernel optimization to its boundaries.
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    is_riemannian = (
+        (isinstance(kernel, str) and kernel == "riemannian_pullback")
+        or isinstance(kernel, RiemannianPullbackKernel)
+    )
 
-    # Optional PCA dim-reduction. With raw 768-dim and ~1700 samples
-    # the GP can't find local structure; PCA to ~50 dimensions keeps
-    # the principal variance and lets the kernel discriminate
-    # neighborhoods.
-    pca: PCA | None = None
-    if pca_components is not None and pca_components < X_scaled.shape[1]:
-        n_components = min(pca_components, X_scaled.shape[0] - 1)
-        if n_components >= 1:
-            pca = PCA(n_components=n_components, random_state=0)
-            X_gp = pca.fit_transform(X_scaled)
+    if is_riemannian:
+        # Bypass scaler + PCA: the kernel internally maps raw embeddings
+        # to score space via Stage-2 (which has its own StandardScaler
+        # inside Pipeline(StandardScaler, head)), so an outer scaler
+        # would force a needless inverse-transform on every kernel call.
+        # The ε-RBF tiebreaker term operates on raw distances, which is
+        # fine for a regularizer (its job is PD-ness, not signal).
+        scaler: StandardScaler | None = None
+        pca: PCA | None = None
+        X_gp = X
+        sub_axes = (
+            tuple(metric.sub_condition_ids)
+            if metric is not None and metric.sub_condition_ids
+            else tuple(s.id for s in policy.rubric.sub_conditions)
+        )
+        gp = _fit_gp_arrays(
+            X_gp,
+            y,
+            kernel=kernel,
+            alpha=alpha,
+            n_restarts_optimizer=n_restarts_optimizer,
+            stage2_model=stage2_model,
+            metric=metric,
+            sub_condition_axes=sub_axes,
+            riemannian_kernel_kwargs=riemannian_kernel_kwargs,
+        )
+        kernel_kind = "riemannian_pullback"
+    else:
+        # Scale features so the kernel's length_scale settles in a finite
+        # range. Without this, raw 768-dim Bio_ClinicalBERT magnitudes
+        # drive the kernel optimization to its boundaries.
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        # Optional PCA dim-reduction. With raw 768-dim and ~1700 samples
+        # the GP can't find local structure; PCA to ~50 dimensions keeps
+        # the principal variance and lets the kernel discriminate
+        # neighborhoods.
+        pca = None
+        if pca_components is not None and pca_components < X_scaled.shape[1]:
+            n_components = min(pca_components, X_scaled.shape[0] - 1)
+            if n_components >= 1:
+                pca = PCA(n_components=n_components, random_state=0)
+                X_gp = pca.fit_transform(X_scaled)
+            else:
+                X_gp = X_scaled
         else:
             X_gp = X_scaled
-    else:
-        X_gp = X_scaled
 
-    gp = _fit_gp_arrays(
-        X_gp,
-        y,
-        kernel=kernel,
-        alpha=alpha,
-        n_restarts_optimizer=n_restarts_optimizer,
-    )
+        gp = _fit_gp_arrays(
+            X_gp,
+            y,
+            kernel=kernel,
+            alpha=alpha,
+            n_restarts_optimizer=n_restarts_optimizer,
+        )
+        if isinstance(kernel, str):
+            kernel_kind = kernel
+        elif isinstance(kernel, GibbsKernel):
+            kernel_kind = "non_stationary"
+        else:
+            kernel_kind = "stationary"
 
     library_anchors: dict[str, list[float]] = {}
     library_text_payload: dict[str, str] = {}
@@ -538,6 +861,8 @@ def fit_compliance_gp(
         pca=pca,
         training_texts=[p.text for p in points],
         library_anchor_texts=library_text_payload,
+        kernel_kind=kernel_kind,
+        metric_fit_id=metric_fit_id if is_riemannian else None,
     )
 
 
@@ -739,9 +1064,11 @@ __all__ = [
     "GPTarget",
     "GibbsKernel",
     "QuartileDiagnostic",
+    "RiemannianPullbackKernel",
     "TrainingPoint",
     "fit_compliance_gp",
     "non_stationary_kernel",
     "propose_targets",
     "quartile_diagnostics",
+    "riemannian_pullback_kernel",
 ]

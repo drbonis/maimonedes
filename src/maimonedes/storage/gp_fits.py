@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Float, Integer, String, Text, select
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, select
 from sqlalchemy.orm import Mapped, mapped_column
 
 from maimonedes.storage.models import Base
@@ -27,6 +27,16 @@ class GPFitRow(Base):
     kernel_name: Mapped[str] = mapped_column(String(256), nullable=False)
     log_marginal_likelihood: Mapped[float] = mapped_column(Float, nullable=False)
     embedding_model: Mapped[str] = mapped_column(String(128), nullable=False)
+    # Issue #62: normalized kernel kind ("stationary" | "non_stationary" |
+    # "riemannian_pullback") + FK to the consumed metric_fits row (riemannian
+    # pullback only). Older rows default to "stationary" / NULL via migration
+    # 0018.
+    kernel_kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, server_default="stationary"
+    )
+    metric_fit_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("metric_fits.id", ondelete="SET NULL"), nullable=True
+    )
 
 
 def record_gp_fit(
@@ -37,6 +47,8 @@ def record_gp_fit(
     kernel_name: str,
     log_marginal_likelihood: float,
     embedding_model: str,
+    kernel_kind: str = "stationary",
+    metric_fit_id: int | None = None,
 ) -> int:
     with get_session() as session:
         row = GPFitRow(
@@ -46,6 +58,8 @@ def record_gp_fit(
             kernel_name=kernel_name,
             log_marginal_likelihood=log_marginal_likelihood,
             embedding_model=embedding_model,
+            kernel_kind=kernel_kind,
+            metric_fit_id=metric_fit_id,
         )
         session.add(row)
         session.flush()
