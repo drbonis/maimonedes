@@ -31,15 +31,15 @@ The system is a monitoring apparatus that observes the text outputs of a monitor
 1. **A probe library subsystem** (4.1) maintaining anchor probes (fixed test prompts), perturbation probes (controlled variations of anchors), and synthesized probes (machine-generated near-boundary scenarios).
 2. **A two-stage compliance scorer** (4.2) producing a continuous per-policy compliance score from each text output, comprising a rubric-decomposed LLM-judge stage (stage-1) and a fine-tuned regression-head stage (stage-2).
 3. **A calibration subsystem** (4.3) measuring agreement between the compliance scorer and a hand-scored reference corpus and producing a status gate that controls downstream pipeline activation.
-4. **A persistent score store** (4.4) recording per-output sub-condition scores, aggregates, scorer identities, and probe-role provenance, indexed for temporal retrieval.
-5. **A dual Gaussian-process layer** (4.5) comprising an **input-side fit** over prompt embeddings and a **response-side fit** over output-text embeddings, each fitted with stationary and non-stationary kernels, each producing posterior predictive mean and standard deviation, and each carrying a candidate-target proposer combining uncertainty with proximity to the violation boundary under quartile-stratified seeding. The input-side fit is consulted by the probe synthesizer for self-consistent target proposal in input-prompt space; the response-side fit retains the Riemannian-pullback kernel and is consulted for post-hoc acceptance scoring of synthesized probes, for monitoring, and for feedback.
-6. **A Riemannian metric learner** (4.6) producing two position-dependent metric tensor fields over compliance-score space — `g_input(c)` fitted on input-perturbation Jacobians and `g_stoch(c)` fitted on multi-sample sampling-stochasticity Jacobians obtained by repeated invocations of the supervised LLM on identical prompts — together with a derived total metric `g_total(c) = g_input(c) + g_stoch(c)` corresponding to the law-of-total-variance decomposition `Var(score) = E[Var(score|prompt)] + Var(E[score|prompt])` of the score vector into aleatoric (LLM-stochasticity) and prompt-sensitivity components.
+4. **A persistent score store** (4.4) recording per-output and per policy scores, aggregated scores, scorer identities, and probe-role provenance, indexed for temporal retrieval.
+5. **A dual Gaussian-process layer** (4.5) comprising an **input-side fit** over prompt embeddings and a **response-side fit** over output-text embeddings, each fitted with stationary and optionally non-stationary kernels, each producing posterior predictive mean and standard deviation of overall compliance score, and each carrying a candidate-target proposer combining uncertainty with proximity to the violation boundary under quartile-stratified seeding. The input-side fit is consulted by the probe synthesizer for self-consistent target proposal in input-prompt space; the response-side fit can also use the Riemannian-pullback kernel and is consulted for post-hoc acceptance scoring of synthesized probes, for monitoring, and for feedback.
+6. **A Riemannian metric learner** (4.6) producing two position-dependent metric tensor fields over compliance-score space. `g_input(c)` fitted on input-perturbation Jacobians and `g_stoch(c)` fitted on multi-sample Jacobians obtained by repeated invocations of the supervised LLM on identical prompts, together with a derived total metric `g_total(c) = g_input(c) + g_stoch(c)`.
 7. **A probe synthesizer** (4.7) producing new test scenarios at machine-proposed embedding-space targets via K-nearest-neighbor exemplar prompting with re-embedding-based target verification, in either a target-driven or a gradient-driven mode.
 8. **A monitoring signal subsystem** (4.8) producing four orthogonal signals (drift, fragility, decoupling, curvature) over the learned compliance-space geometry.
 9. **A feedback subsystem** (4.9) generating natural-language remediation messages from contrastive evidence pairs and delivering them through one or more injection channels.
 10. **An experiment-controller subsystem** (4.10) coordinating run-once, drift-induction, perturbation, recovery, and feedback-application sessions, and recording their results for monitoring purposes.
 
-The subsystems share two common substrates: the per-output compliance score (produced by 2 and stored by 4) and the learned Riemannian geometry of compliance-score space (produced by 6 and consumed by 5, 7, 8, and 9). The Riemannian geometry is itself decomposed into two complementary tensor fields (`g_input` and `g_stoch`) whose sum captures the total variance budget of the compliance score at each coordinate, and whose individual eigenstructures distinguish input-sensitivity fragility from inherent LLM stochasticity.
+The subsystems share two common substrates: the per-output compliance score (produced by 2 and stored by 4) and the learned Riemannian geometry of compliance-score space (produced by 6 and consumed by 5, 7, 8, and 9). The Riemannian geometry is itself decomposed into two complementary tensor fields (`g_input` and `g_stoch`) whose sum captures the total variance of the compliance score at each coordinate, and whose individual eigenstructures distinguish input-sensitivity fragility from inherent LLM stochasticity.
 
 ---
 
@@ -60,7 +60,7 @@ Programmatically-generated variations of anchor probes, each carrying a referenc
 - **Authority framing (123).** Insertion or removal of authority cues (e.g., "the senior cardiologist requests").
 - **Boundary approach (124).** Incremental movement of the input scenario toward the policy boundary by lexical substitution along a configured boundary direction.
 
-Each perturbation kind is implemented by a dedicated generator module that takes an anchor and produces one or more variants. Generators may be rule-based (substitution from configured tables) or LLM-based (paraphrase generator). Generation outputs are persisted to the probe store with anchor reference, generator identifier, and perturbation kind.
+Each perturbation kind is implemented by a dedicated generator module that takes an anchor and produces one or more variants. Generators may be rule-based (substitution from configured tables) or LLM-based (e.g. paraphrase generator). Generation outputs are persisted to the probe store with anchor reference, generator identifier, and perturbation kind.
 
 #### 4.1.3 Synthesized probes (130)
 
@@ -74,22 +74,22 @@ The Stage-1 scorer accepts as input (i) a policy specification, (ii) a rubric sp
 
 The rubric specification is a structured document declaring, for each policy sub-condition: an identifier, a description, a scale type, and a weight. The supported scale types are:
 
-- **`boolean`** — yes/no scale; the judge model returns a boolean which the framework maps to {0.0, 1.0}.
-- **`"0-3"`** — four-level ordinal scale; the judge returns an integer in {0, 1, 2, 3} which the framework normalises by division by 3.
-- **`labels`** — Behaviorally Anchored Rating Scale (BARS); the rubric enumerates a fixed list of labels each carrying a per-label `value` in [0, 1] and a behavioral description, and the judge returns the identifier of one label which the framework maps to its declared `value`.
+- **`boolean`**: yes/no scale; the judge model returns a boolean which the framework maps to {0.0, 1.0}.
+- **`"0-3"`**: four-level ordinal scale; the judge returns an integer in {0, 1, 2, 3} which the framework normalises by division by 3.
+- **`labels`**_ Behaviorally Anchored Rating Scale (BARS); the rubric enumerates a fixed list of labels each carrying a per-label `value` in [0, 1] and a behavioral description, and the judge returns the identifier of one label which the framework maps to its declared `value`.
 
-The judge model is invoked with a JSON-schema-enforced request specifying the response shape (one entry per sub-condition, with the value type matching the declared scale). The response is parsed by Component 213, normalised by Component 214, and passed to Component 215, which computes the policy aggregate as the rubric-weighted sum of normalised per-sub-condition scores. Sub-condition weights sum to one by construction; the framework, not the judge model, owns the aggregation.
+The judge model is invoked with a JSON-schema-enforced request specifying the response shape (one entry per sub-condition, with the value type matching the declared scale). The response is parsed, normalised and used to compute the policy compliance aggregate as the rubric-weighted sum of normalised per-sub-condition scores. Sub-condition weights sum to one by construction; the framework, not the judge model, owns the aggregation.
 
 Two structural properties of the BARS rubric are operationally significant:
 
 - **Label monotonicity.** Labels are ordered such that values are monotonically non-increasing from most-compliant to least-compliant, so that the BARS-derived sub-condition score is itself an ordinal estimate.
-- **Behavioral distinctness.** The rubric specification carries a constraint that adjacent labels must describe distinct, observable behaviors, so that the judge model selects between behavioral descriptions rather than between ordinal positions on an implicit numeric scale.
+- **Behavioral distinctness.** The rubric specification carries a constraint that adjacent labels must describe distinct, observable behaviors, so that the judge model selects between behavioral descriptions rather than between ordinal positions.
 
 #### 4.2.2 Stage-2 fine-tuned scorer (220)
 
-The Stage-2 scorer accepts as input the supervised system's output text and produces as output the same vector of compliance scores as Stage-1. It comprises (i) an output-text encoder producing an embedding vector in fixed dimension, e.g. a clinically-tuned transformer encoder producing a 768-dimensional embedding, and (ii) a per-policy-axis regression head, e.g. an sklearn `Pipeline(StandardScaler, RidgeRegressor)` or `Pipeline(StandardScaler, MLPRegressor)`, fitted on `(text, score)` training pairs produced by Stage-1.
+The Stage-2 scorer accepts as input the supervised system's output text and produces as output the same vector of compliance scores as Stage-1. It comprises (i) an output-text encoder producing an embedding vector in fixed dimension, e.g. a clinically-tuned transformer encoder producing a 768-dimensional embedding, and (ii) a per-policy-axis regression head, e.g. a Ridge Regressor or a Multilayer Perceptron, fitted on `(text, score)` training pairs produced by Stage-1.
 
-The Stage-2 scorer is the primary scorer in production. Its consistency property — same output text always producing the same score — derives from the deterministic encoder and the deterministic regression head, and is required for reliable temporal drift detection.
+The Stage-2 scorer is the primary scorer in production. Its consistency property (same output text always producing the same score) derives from the deterministic encoder and the deterministic regression head, and is required for reliable temporal drift detection.
 
 #### 4.2.3 Stage-2 audit subsystem (230)
 
@@ -110,56 +110,48 @@ A process that, for each tuple in the reference corpus, invokes the compliance s
 - A binned calibration curve mapping predicted aggregate buckets to mean hand aggregate.
 - A status flag computed by thresholding the Spearman correlation: `green` if `≥ 0.7`, `yellow` if `≥ 0.5`, `red` otherwise.
 
-The output is a structured report (CSV in the reference implementation) containing the summary statistics and the per-tuple agreement.
-
-#### 4.3.3 Calibration history monitor — monitor-of-the-monitor (330)
+#### 4.3.3 Calibration history monitor:  monitor-of-the-monitor (330)
 
 A subsystem that runs Component 320 on a recurring schedule against a stable reference corpus, persisting each report's summary statistics with timestamp, and applying Statistical Process Control (SPC) monitoring to those statistics over time. An alert is raised when the Spearman correlation drops or the mean absolute error rises beyond a threshold computed from the historical baseline. This alert is dispatched on a separate channel from the alerts produced by Component 700, so as to disambiguate "the supervised system has drifted" from "the compliance scorer has drifted."
 
 ### 4.4 Persistent Score Store (Component 400)
 
-A relational data store comprising at least the following tables:
-
-- `compliance_scores` — one row per scored output, recording anchor identifier, policy identifier, per-sub-condition normalised scores (as JSON), aggregate, judge model identifier, supervised model identifier, timestamp, probe role (anchor / perturbation / synthesized), and references to perturbation, drift-session, recovery-run, and synthesized-probe records.
-- `perturbation_probes` — generated perturbation variants with anchor reference and generator metadata.
-- `synthesized_probes` — outputs of Component 600 with target embedding, achieved similarity, generator metadata, and quality-gate verdict.
-- `gp_fits` — persisted Gaussian-process artefacts (Component 500).
-- `metric_fits` — persisted Riemannian-metric artefacts (Component 600 in §4.6).
-- `drift_sessions`, `drift_runs`, `recovery_runs`, `audit_runs`, `structural_signals` — operational session and signal records.
-- `llm_calls`, `embed_calls` — recordings of all model invocations for replay and audit.
+The persistent score store is a database configured to maintain the historical and operational state of the system. Contains following information:  
+- Measurement and Evaluation Records: The comprehensive scoring history for every evaluated text output. 
+- Test Scenario Archives: The complete library of programmatically modified and machine-synthesized test prompts. 
+- Learned Statistical and Geometric Artifacts: The finalized, fitted mathematical models.
+- Operational and Audit Logs: Chronological records of continuous monitoring sessions, structural tests, and recovery events.
 
 ### 4.5 Gaussian-Process Layer (Component 500)
 
 The Gaussian-process layer is instantiated as **two parallel fits sharing a common subcomponent architecture**, distinguished only by the text corpus over which they are trained:
 
-- **Input-side fit (Component 500-I).** Fitted over `(prompt_text, aggregate_score)` pairs in which `prompt_text` is the input scenario sent to the supervised LLM. The input-side fit is operational and cheap to evaluate (no LLM round-trip required at inference time). It supplies embedding-space targets to the probe synthesizer in a space self-consistent with the synthesizer's K-nearest-neighbor exemplar substrate (Component 710), eliminating the input/output type mismatch that would otherwise arise when targets in response-embedding space are matched to candidate scenarios in input-embedding space.
-- **Response-side fit (Component 500-R).** Fitted over `(response_text, aggregate_score)` pairs in which `response_text` is the supervised LLM's output. The response-side fit is the primary substrate consumed by the Riemannian-pullback kernel of §4.5.3 (since the Stage-2 scorer of Component 222 maps response embeddings to score space and is undefined on prompt embeddings), by the monitoring signal subsystem (Component 800), and by the feedback subsystem (Component 900). It is also consulted by the probe synthesizer at acceptance-scoring time, after a candidate scenario has been routed through the supervised LLM and its response embedded.
+- **Input-side fit (Component 500-I).** Fitted over `(prompt_text, aggregate_score)` pairs in which `prompt_text` is the input scenario sent to the supervised LLM. The input-side fit is cheaper to evaluate (no supervised LLM execution required at inference time). It supplies embedding-space targets to the probe synthesizer in a space self-consistent with the synthesizer's K-nearest-neighbor exemplar substrate (Component 700).
+- **Response-side fit (Component 500-R).** Fitted over `(response_text, aggregate_score)` pairs in which `response_text` is the supervised LLM's output. The response-side fit is the primary substrate consumed by the Riemannian-pullback kernel of §4.5.3, by the monitoring signal subsystem (Component 800), and by the feedback subsystem (Component 900). It is also consulted by the probe synthesizer at acceptance-scoring time, after a candidate scenario has been routed through the supervised LLM and its response embedded.
 
-Both fits share Components 510, 520, 530, 540, and 550 below, instantiated independently per fit. Disagreement between the two fits at a common compliance-space coordinate is itself a diagnostic signal — a region in which the input-side and response-side posteriors diverge localises **prompt-conditional response variance** (the aleatoric component captured by `g_stoch` in §4.6) and is exposed to the monitoring subsystem as an auxiliary signal.
+Both fits share Components 510, 520, 530, 540, and 550 below, instantiated independently per fit. Disagreement between the two fits at a common compliance-space coordinate is itself a diagnostic signal that can identify region in which the input-side and response-side posteriors diverge and is exposed to the monitoring subsystem as an auxiliary signal.
 
 #### 4.5.1 Training pair extractor (510)
 
-Reads `compliance_scores` and the corresponding stored texts, deduplicating on text and resolving multi-score collisions by aggregation (mean), to produce a set of `(text, aggregate)` training pairs. The extractor is invoked twice per fit cycle: once with `text = prompt_text` for the input-side fit (Component 500-I) and once with `text = response_text` for the response-side fit (Component 500-R).
+Reads `compliance_scores` and the corresponding stored texts, deduplicating on text and resolving multi-score collisions by aggregation (mean), to produce a set of `(text, aggregate)` training pairs.
 
 #### 4.5.2 Embedding pipeline (520)
 
-Embeds each training text via the same encoder used by Stage-2 (Component 221). Both prompt texts and response texts are embedded with the identical encoder so that the two fits operate in commensurable 768-dimensional spaces; the encoder's fitness for the prompt-side corpus is assumed and is monitored by the agreement of the input-side and response-side GP posteriors (a sustained divergence of input-side and response-side posteriors over a stable score region is a signal that the encoder fails to align prompt and response semantics in this domain, reportable to the monitoring subsystem).
+Embeds each training text via an encoder. In the default embodiment the same encoder used by Stage-2 (Component 221) is applied to both prompt texts and response texts; in an alternate embodiment, **separate encoders per side (optional)** are used (e.g. a prompt-tuned encoder for input texts and a response/clinical-note-tuned encoder for response texts), and the two encoders need not produce embeddings of equal dimensionality.
 
 #### 4.5.3 Kernel selector (530)
 
 The fitting routine accepts a kernel-selector argument with at least three values:
 
-- **`stationary`** — instantiates an RBF kernel over a preprocessing chain comprising (i) a `StandardScaler` over the embedding dimensions, (ii) a `PCA` projection to a reduced dimension (e.g. 50), and (iii) a noise term `α` (e.g. 10⁻²) on the Gaussian Process (GP) likelihood. The preprocessing chain addresses the curse-of-dimensionality and the duplicate-output noise simultaneously.
-- **`non_stationary`** — instantiates a Gibbs kernel with a position-dependent length-scale `ℓ(x) = exp(a + b·u(x) + c·u(x)²)` parameterised by hyperparameters `(σ, a, b, c)` and a one-dimensional projection `u(·)`. Hyperparameters are optimised externally to sklearn (the marginal likelihood is maximised by a separate solver and the optimised kernel is then handed to sklearn for prediction) because the Gibbs hyperparameters are real-valued and cannot be driven directly by sklearn's bounded log-scale optimiser.
+- **`stationary`**: instantiates an RBF kernel over a preprocessing chain comprising (i) a `StandardScaler` over the embedding dimensions, (ii) a `PCA` projection to a reduced dimension (e.g. 50), and (iii) a noise term `α` (e.g. 10⁻²) on the Gaussian Process (GP) likelihood. The preprocessing chain addresses the curse-of-dimensionality and the duplicate-output noise simultaneously.
+- **`non_stationary`** — instantiates a Gibbs kernel with a position-dependent length-scale `ℓ(x) = exp(a + b·u(x) + c·u(x)²)` parameterised by hyperparameters `(σ, a, b, c)` and a one-dimensional projection `u(·)`.
 - **`riemannian_pullback`** — instantiates a metric-warped kernel that consumes the compliance-space metric tensor field of Component 600 by routing input embeddings through the Stage-2 compliance scorer of Component 222 and applying the metric in score space. For embeddings `e_1`, `e_2` with predicted score vectors `c_i = f(e_i)` and score-space midpoint `m_c = (c_1 + c_2) / 2`, the kernel is
 
   ```
   k(e_1, e_2) = σ² · exp(−½ · (c_1 − c_2)^T · g(m_c) · (c_1 − c_2) / ℓ²) + ε · exp(−½ · ‖e_1 − e_2‖² / ℓ_E²)
   ```
 
-  where `g(m_c)` is the local metric tensor produced by Component 620 evaluated at `m_c`, the first term is a Mahalanobis-form kernel applied to the score-space images of `f` (positive-semidefinite by construction), and the second `ε · k_RBF` term (`ε ≪ σ²`) is a small isotropic embedding-space tiebreaker rendering the composite kernel positive-definite even when distinct embeddings collapse to identical score vectors under `f`. The GP posterior trained under this kernel inherits the fragility geometry of compliance-score space, so that the candidate-target proposer of §4.5.5 ranks more highly those embeddings whose score predictions place them in high-curvature regions of the boundary, where small perturbations produce disproportionate compliance changes. An alternative embodiment uses a local Jacobian-based embedding-space pullback `g_E(e) = J_f(e)^T · g(f(e)) · J_f(e) + ε · I`, with `J_f` computed by the same central-differences finite-differencing routine used by Component 730, applying `g_E(m)` at the embedding-space midpoint `m = (e_1 + e_2)/2`. Both forms eliminate any requirement for backprop access to the Stage-2 head and are agnostic to the head's function-approximator family.
-
-Each kernel produces a `ComplianceGP` artefact persisted to disk and referenced from a `gp_fits` row.
+  where `g(m_c)` is the local metric tensor produced by Component 620 evaluated at `m_c`, the first term `σ² · exp(−½ · (c_1 − c_2)^T · g(m_c) · (c_1 − c_2) / ℓ²)` is a Mahalanobis-form kernel applied to the score-space images of `f` (positive-semidefinite by construction), and the second `ε · exp(−½ · ‖e_1 − e_2‖² / ℓ_E²)` term (`ε ≪ σ²`) is a small Radial Basis Function stationary kernel tiebreaker rendering the composite kernel positive-definite even when distinct embeddings collapse to identical score vectors under `f`. The GP posterior trained under this kernel inherits the fragility geometry of compliance-score space, so that the candidate-target proposer of §4.5.5 ranks more highly those embeddings whose score predictions place them in high-curvature regions of the boundary, where small perturbations produce disproportionate compliance changes. An alternative embodiment uses a local Jacobian-based embedding-space pullback `g_E(e) = J_f(e)^T · g(f(e)) · J_f(e) + ε · I`, with `J_f` computed by the same central-differences finite-differencing routine used by Component 730, applying `g_E(m)` at the embedding-space midpoint `m = (e_1 + e_2)/2`. Both forms eliminate any requirement for backprop access to the Stage-2 head and are agnostic to the head's function-approximator family.
 
 #### 4.5.4 Posterior predictor (540)
 
@@ -169,7 +161,7 @@ For an arbitrary test embedding, returns the posterior mean (a compliance score 
 
 A subsystem that selects embedding-space points to use as targets for the probe synthesizer. The proposer:
 
-1. Constructs a candidate pool by **quartile-stratified seeding**: training observations are bucketed into compliance-score quartiles and the candidate pool draws an equal share from each bucket. This counters the production-distribution skew toward compliance, which would otherwise cause naive uniform sampling to under-represent the boundary region.
+1. Constructs a candidate pool by **quartile-stratified seeding**: training observations are bucketed into compliance-score quartiles and the candidate pool draws an equal share from each bucket. This mitigates the distribution skew toward compliance, which would otherwise under-represent the boundary region.
 2. For each candidate, computes a score combining posterior uncertainty with proximity to the violation boundary:
 
    ```
@@ -188,7 +180,7 @@ Var(score) = E[ Var(score | prompt) ] + Var( E[score | prompt] )
               └────── g_stoch ──────┘    └────── g_input ──────┘
 ```
 
-`g_input(c)` captures **prompt-sensitivity fragility** — how the score moves when the input is perturbed, holding the LLM's sampling RNG implicit. `g_stoch(c)` captures **inherent LLM stochasticity** — how the score moves when the input is held fixed and only the LLM's sampling realisation varies. Their sum `g_total(c)` is the operative total fragility metric. Either field individually, or any positive-weighted combination, can be supplied to downstream consumers (the Riemannian distance computer of §4.6.3, the pullback kernel of §4.5.3, the curvature signal of §4.8.4).
+`g_input(c)` captures **prompt-sensitivity fragility** or how the score moves when the input is perturbed. `g_stoch(c)` captures **inherent LLM stochasticity** or how the score moves when the input is held fixed and only the LLM's sampling realisation varies. Their sum `g_total(c)` is the operative total fragility metric. Either field individually, or any positive-weighted combination, can be supplied to downstream consumers (the Riemannian distance computer of §4.6.3, the pullback kernel of §4.5.3, the curvature signal of §4.8.4).
 
 ##### 4.6.1a Input-perturbation Jacobian (610a)
 
@@ -198,7 +190,7 @@ For each anchor probe, the perturbation cloud (Component 120) provides, for each
 g_input_target(c_anchor) = J_input^T J_input / ‖J_input‖²
 ```
 
-at the compliance-space coordinate `c_anchor` corresponding to the anchor's pre-perturbation compliance vector. This Jacobian estimates the second term of the variance decomposition above — the variance of the conditional-mean compliance score across input prompts — and reproduces the construction of prior embodiments of Component 610.
+at the compliance-space coordinate `c_anchor` corresponding to the anchor's pre-perturbation compliance vector. This Jacobian estimates the second term of the variance decomposition above or in other words, the variance of the conditional-mean compliance score across input prompts.
 
 ##### 4.6.1b Sampling-stochasticity Jacobian (610b)
 
@@ -206,9 +198,9 @@ For each anchor probe, the multi-sample stochasticity driver (Component 1060 of 
 ```
 g_stoch_target(c_anchor) = J_stoch^T J_stoch / ‖J_stoch‖²
 ```
-at the same compliance-space coordinate `c_anchor`. This Jacobian estimates the first term of the variance decomposition above — the expected within-prompt variance of the score vector — and constitutes the metric-learning analogue of Fisher information for the conditional response distribution `p(score | prompt)`.
+at the same compliance-space coordinate `c_anchor`. This Jacobian estimates the first term of the variance decomposition above or in other words, the expected within-prompt variance of the score vector.
 
-In embodiments where the compliance scorer of §4.2 contains an internally-stochastic component (e.g., an LLM-as-judge with non-zero temperature), `g_stoch_target` mixes LLM-sampling variance with judge variance. The reference embodiment isolates LLM-sampling variance by re-judging each of the `N` responses `K` times (`K ≥ 3`) and using the per-response mean score vector as the row entry, producing a judge-decorrelated `J_stoch`. An equivalent embodiment fits a third metric field `g_judge` from `K` re-judgings of a single response and reports `g_stoch_clean = g_stoch_total ⊖ g_judge` under a positive-semidefinite-preserving subtraction (e.g., projection of `g_stoch_total − g_judge` onto the PSD cone via spectral clipping).
+In embodiments where the compliance scorer of §4.2 contains an internally-stochastic component (e.g., an LLM-as-judge with non-zero temperature), `g_stoch_target` mixes LLM-sampling variance with judge variance. The reference embodiment isolates LLM-sampling variance by re-judging each of the `N` responses `K` times (`K ≥ 3`) and using the per-response mean score vector as the row entry, producing a judge-decorrelated `J_stoch`.
 
 #### 4.6.2 Metric MLPs (620)
 
@@ -217,7 +209,7 @@ A small feed-forward neural network mapping a compliance-space coordinate `c ∈
 - The first `k` entries are exponentiated to populate the diagonal of `L`.
 - The remaining `k(k−1)/2` entries populate the strictly-lower triangle of `L` unchanged.
 
-This parameterisation makes `g(c)` strictly positive-definite for any finite raw parameter vector. **Two MLPs are trained** with the architecture above: one minimising the Frobenius-norm loss between predicted `g_input(c_anchor)` and `g_input_target(c_anchor)`, and a second minimising the same loss between predicted `g_stoch(c_anchor)` and `g_stoch_target(c_anchor)`. Training uses pure-numpy forward and backward passes plus an Adam optimiser; persistence is `numpy.savez_compressed` to two `.npz` files referenced from one `metric_fits` row carrying both artefact paths and a `kind ∈ {input, stoch}` discriminator per artefact.
+This parameterisation makes `g(c)` strictly positive-definite for any finite raw parameter vector and prevents Gaussian Process optimized collapse. **Two MLPs are trained** with the architecture above: one minimising the Frobenius-norm loss between predicted `g_input(c_anchor)` and `g_input_target(c_anchor)`, and a second minimising the same loss between predicted `g_stoch(c_anchor)` and `g_stoch_target(c_anchor)`.
 
 #### 4.6.3 Riemannian distance computer (630)
 
@@ -227,70 +219,50 @@ Given a metric artefact and two compliance-space coordinates `c_0`, `c_1`, the d
 d(c_0, c_1) ≈ Σ_i √( Δc_i^T  g(c_mid_i)  Δc_i )
 ```
 
-over `n_segments` equal sub-intervals. This is a strict upper bound on the true geodesic distance under `g`, tight whenever `g` is locally smooth, and is the operational quantity used by drift and feedback subsystems. The computer is metric-agnostic and accepts any of `g_input`, `g_stoch`, or `g_total` (see §4.6.4); the consumer subsystem selects which metric to integrate based on its semantic question — `g_input` for input-sensitivity drift, `g_stoch` for stochasticity drift, `g_total` for total-fragility drift.
+over `n_segments` equal sub-intervals. This is an approximation on the true geodesic distance under `g` and is the value used by drift and feedback subsystems. The computer is metric-agnostic and accepts any of `g_input`, `g_stoch`, or `g_total` (see §4.6.4); the consumer subsystem selects which metric to integrate based on its semantic question: `g_input` for input-sensitivity drift, `g_stoch` for stochasticity drift, `g_total` for total-fragility drift.
 
 #### 4.6.4 Total-fragility metric (640)
 
-A derived metric tensor field defined pointwise as `g_total(c) = g_input(c) + g_stoch(c)`. The sum of two positive-definite tensors is positive-definite, so no separate Cholesky parameterisation is required. `g_total(c)` is the unique tensor consistent with the law-of-total-variance decomposition of `Var(score | c)` and is the recommended default consumer for the monitoring signal subsystem (Component 800), the feedback subsystem (Component 900), and the Riemannian-pullback kernel (Component 530, `riemannian_pullback` option). Embodiments that distinguish failure modes — e.g., a fragility-source attribution dashboard separating "the LLM is becoming more stochastic" from "the LLM is becoming more input-sensitive" — consume `g_input` and `g_stoch` independently.
+A derived metric tensor field defined pointwise as `g_total(c) = g_input(c) + g_stoch(c)`. The sum of two positive-definite tensors is positive-definite, so no separate Cholesky parameterisation is required. `g_total(c)` is the default for the monitoring signal subsystem (Component 800), the feedback subsystem (Component 900), and the Riemannian-pullback kernel (Component 530, `riemannian_pullback` option). Embodiments that distinguish failure modes (e.g., a fragility-source attribution dashboard separating "the LLM is becoming more stochastic" from "the LLM is becoming more input-sensitive") consume `g_input` and `g_stoch` independently.
 
 ### 4.7 Probe Synthesizer (Component 700)
 
-The probe synthesizer accepts an embedding-space target produced by the **input-side GP** (Component 500-I, §4.5) and produces a new test scenario whose **input-prompt** embedding is verified to be within a configured cosine similarity of the target, and whose **response embedding** — obtained by routing the candidate scenario through the supervised LLM — passes a response-side acceptance score computed via the **response-side GP** (Component 500-R, §4.5). It operates in two modes that share a common synthesis substrate.
+The probe synthesizer accepts an embedding-space target produced by the **input-side GP** (Component 500-I, §4.5) and produces a new test scenario whose **input-prompt** embedding is verified to be within a configured cosine similarity of the target, and whose **response embedding** (obtained by routing the candidate scenario through the supervised LLM) passes a response-side acceptance score computed via the **response-side GP** (Component 500-R, §4.5). It operates as follows:
 
-#### 4.7.1 K-NN exemplar synthesizer — common substrate (710)
+#### 4.7.1 K-NN exemplar synthesizer
 
 For an input-embedding-space target `e_target` produced by the candidate-target proposer of Component 500-I:
 
 1. Find the K=5 library anchor probes whose **prompt embeddings** have highest cosine similarity to `e_target`. (Library anchor prompts are pre-embedded by Component 520 at fit time and cached on the GP artefact.)
 2. Construct a generator-LLM prompt comprising those K anchor scenarios as exemplars, with an instruction to produce a new scenario clinically similar to but distinct from the exemplars and exploring the gap between them. The prompt enforces structural anchors (e.g., a substitutable first name, age token, and profession) required by downstream perturbation generators.
 3. Invoke the generator LLM. Strip meta-prefixes ("Okay, I understand the rules…", markdown headers, numbered list prefixes) from the response, retaining the scenario text.
-4. **Input-side similarity pre-screen.** Re-embed the cleaned scenario via Component 520 and compute the cosine similarity between the re-embedding and `e_target`. This step operates entirely in input-prompt-embedding space and is consistent in type with the GP that produced `e_target`. If the similarity is below a configured threshold `τ` (e.g. 0.7), and a per-target retry budget remains, re-prompt with a small instructional nudge and return to step 3.
-5. **Supervised-LLM round-trip.** Route the cleaned scenario through the supervised LLM, capture the response text, and embed the response via the same encoder of Component 520. The response embedding is denoted `r_obtained`.
+4. **Input-side similarity pre-screen.** Re-embed the new scenario via Component 520 and compute the cosine similarity between the embedding and `e_target`. If the similarity is below a configured threshold `τ` (e.g. 0.7), and a per-target retry budget remains, re-prompt with a small instructional nudge and return to step 3.
+5. **Supervised-LLM round-trip.** Route the new scenario through the supervised LLM, capture the response text, and embed the response via the same encoder of Component 520. The response embedding is denoted `r_obtained`.
 6. **Response-side acceptance scoring.** Evaluate the response-side GP (Component 500-R) at `r_obtained` to obtain a posterior mean `μ_r` and posterior standard deviation `σ_r`, and compute the response-side acceptance score
    ```
    a(r_obtained) = σ_r × max(0, 1 − 2·|0.5 − μ_r|)
    ```
-   (the same boundary-seeking weight used by the candidate-target proposer of Component 550). Accept the candidate if `a(r_obtained) ≥ a_min`, where `a_min` is a configured floor (default: the lower-quartile boundary of acceptance scores observed across the prior synthesis session, so the floor adapts to the prevailing distribution). The acceptance score quantifies the **information value** of the synthesized probe in the response-side GP's coordinate system, which is the coordinate system in which monitoring, drift, and feedback subsystems operate. Acceptance failures at this step are non-sticky and may consume retry budget.
-7. **Quality gate.** Route the scenario through an LLM-as-validator quality gate (a configured second model called with a validator prompt) that returns an approval / rejection verdict. Validator rejections are sticky (no retry); both input-side similarity rejections (step 4) and response-side acceptance rejections (step 6) are not.
-8. If approved, persist the scenario as a synthesized probe record with input-target embedding `e_target`, achieved input similarity, response embedding `r_obtained`, response-side acceptance score `a(r_obtained)`, exemplar references, and validator verdict. The persisted record is an immediate training contribution to **both** GP fits at the next refit cycle: it joins the input-side fit's training set as a `(prompt, score)` pair and the response-side fit's training set as a `(response, score)` pair.
-9. Optionally, route the new probe through the supervised + Stage-1 judge pipeline OR through the Stage-2 scorer, depending on a configured scoring strategy, and persist the resulting score. (When the supervised-LLM round-trip of step 5 is already configured to capture per-axis scores, this step is subsumed.)
+   (the same boundary-seeking weight used by the candidate-target proposer of Component 550). Accept the candidate if `a(r_obtained) ≥ a_min`, where `a_min` is a configured floor (default: the lower-quartile boundary of acceptance scores observed across the prior synthesis session, so the floor adapts to the prevailing distribution). The acceptance score quantifies the **information value** of the synthesized probe in the response-side GP's coordinate system.
+7. **Quality gate.** Route the scenario through an LLM-as-validator quality gate (a configured second model called with a validator prompt that checks if the scenario is plausible given the domain, for example if the scenario makes sense from a clinical point of view) that returns an approval / rejection verdict.
+8. If approved, persist the scenario as a synthesized probe record with input-target embedding `e_target`, achieved input similarity, response embedding `r_obtained`, response-side acceptance score `a(r_obtained)`, exemplar references, and validator verdict. The persisted record is an immediate training contribution to **both** GP fits at the next refit cycle: it is included in the input-side fit's training set as a `(prompt, score)` pair and the response-side fit's training set as a `(response, score)` pair. 
 
-The K-NN exemplar substrate plays the role of a constrained text generator without requiring a separately-trained constrained text generation model. Constraint enforcement is achieved by **dual verification** — input-prompt re-embedding similarity (step 4, cheap, type-consistent with the input-side GP target) and response-embedding acceptance score (step 6, expensive, type-consistent with the response-side GP and the downstream monitoring substrate) — rather than by constrained-decoding mechanics during generation. The cheap pre-screen filters obvious failures before the expensive supervised-LLM round-trip is paid for; the expensive check enforces the principled criterion (information value in the GP coordinate system that monitoring and feedback actually consume) only on candidates that already passed the cheap filter.
-
-#### 4.7.2 Target-driven mode (720)
-
-The proposer (Component 550) supplies embedding-space targets directly to the K-NN exemplar synthesizer. Used when the operational goal is to expand coverage in high-uncertainty / near-boundary regions.
-
-#### 4.7.3 Gradient-driven mode (730)
-
-A proposer that, for each GP-supplied seed embedding `e_seed`:
-
-1. Computes the descent direction of the Stage-2 model's score for a chosen policy axis (default: the policy's worst-fragility axis as identified by the fragility map of Component 740 below) by central-differences finite-differencing. Two batched forward passes through the Stage-2 head per gradient call compute every coordinate's partial in one shot, which avoids requiring backprop access to the head and works uniformly across head families (Ridge, MLPRegressor).
-2. Steps `e_seed` along that descent direction by a configured step size (default: a fraction of the GP kernel's representative length-scale).
-3. After each step, evaluates the GP posterior (mean, std) at the new position and stops walking if either:
-   - the predicted compliance crosses a violation threshold (default 0.5) — the policy boundary in the Stage-2 model's view; or
-   - the GP posterior standard deviation exceeds an uncertainty cap (default `2 × σ_train_max`) — the boundary of the GP's confidence region; or
-   - the gradient becomes degenerate (zero norm); or
-   - a maximum step count is reached.
-4. Hands the final stepped embedding to Component 710 as the target.
-
-The two modes share Components 710 and Component 540; they differ only in how the embedding-space target is chosen.
+The K-NN exemplar substrate plays the role of a constrained text generator without requiring a separately-trained constrained text generation model. Constraint enforcement is achieved by **dual verification**: 1) input-prompt re-embedding similarity (step 4) and 2) response-embedding acceptance score (step 6). The cheap pre-screen (step 4) filters obvious failures before the expensive supervised-LLM round-trip (step 5) is paid for. As a result the expensive check (step 6) enforces the most important criterion (information value in the GP coordinate system that monitoring and feedback actually consume) only on candidates that already passed the cheap filter (step 4).
 
 ### 4.8 Monitoring Signal Subsystem (Component 800)
 
 #### 4.8.1 CUSUM control chart (810) and EWMA control chart (820)
 
-Per anchor probe, per policy axis, two control charts: a Cumulative Sum chart and an Exponentially Weighted Moving Average chart, both operating on the per-axis compliance score time series read from the score store. Each chart produces an alert when the control statistic exceeds a baseline-derived control limit.
+Per anchor probe and policy axis, two control charts: a Cumulative Sum chart and an Exponentially Weighted Moving Average chart, both operating on the per-axis compliance score time series read from the score store. Each chart produces an alert when the control statistic exceeds a baseline-derived control limit.
 
 Critically, in the configured operational mode the input to each chart is not the Euclidean displacement of the score vector but the **Riemannian displacement** computed via Component 630, so that score trajectories moving toward high-curvature regions of the boundary trigger alerts at smaller absolute displacements than trajectories moving through the safe interior.
 
 #### 4.8.2 Fragility map estimator (830)
 
-Per anchor probe, computes from the perturbation cloud a local sensitivity gradient — per perturbation kind, the mean compliance score change. Aggregated across all anchors, the per-anchor sensitivity gradients constitute a fragility map indexed by anchor and perturbation kind.
+Per anchor probe, computes from the perturbation cloud a local sensitivity gradient and per perturbation kind, the mean compliance score change. Aggregated across all anchors, the per-anchor sensitivity gradients constitute a fragility map indexed by anchor and perturbation kind.
 
 #### 4.8.3 Decoupling signal computer (840)
 
-Tracks the covariance matrix of per-axis perturbation-induced compliance changes, anchor by anchor and over time. An alert fires when the covariance structure between previously-correlated policy axes shows a structural break — e.g., when two axes that historically moved together under a given perturbation kind begin moving independently or in opposite directions.
+Tracks the covariance matrix of per-axis perturbation-induced compliance changes, anchor by anchor and over time. An alert fires when the covariance structure between previously-correlated policy axes shows a structural break, for example when two axes that historically moved together under a given perturbation kind begin moving independently or in opposite directions.
 
 #### 4.8.4 Curvature signal computer (850)
 
@@ -374,11 +346,11 @@ The Stage-1 LLM-as-judge architecture **separates judgment from aggregation**: t
 
 ### 6.4 Embedding-space target verification as a substitute for constrained text generation
 
-The probe synthesizer (Component 710) achieves controlled near-boundary text generation **without a separately-trained constrained text generator**, by combining (i) K-nearest-neighbor exemplar prompting with (ii) post-generation re-embedding and cosine-similarity verification against the original embedding-space target, (iii) bounded retries on similarity failures, and (iv) an LLM-as-validator quality gate. This substitutes a verification-based mechanism for a generation-time constrained-decoding mechanism, reusing existing generator and embedder models.
+The probe synthesizer (Component 700) achieves controlled near-boundary text generation **without a separately-trained constrained text generator**, by combining (i) K-nearest-neighbor exemplar prompting with (ii) post-generation re-embedding and cosine-similarity verification against the original embedding-space target, (iii) bounded retries on similarity failures, and (iv) an LLM-as-validator quality gate. This substitutes a verification-based mechanism for a generation-time constrained-decoding mechanism, reusing existing generator and embedder models.
 
 ### 6.5 Gradient-driven probe synthesis on a learned compliance scorer
 
-The gradient-driven mode (Component 730) computes the descent direction of a learned Stage-2 compliance scorer's per-axis score in embedding space using **central-differences finite-differencing**, steps a candidate embedding along that direction with **dual stopping criteria** (violation-threshold crossing and GP posterior uncertainty cap), and feeds the final embedding into the embedding-space verification mechanism of Component 710. The use of finite-differencing avoids requiring backprop access to the regression head and works uniformly across head families. The dual stopping criterion ensures that gradient extrapolation halts at the boundary of the learned model's confident region rather than continuing into uninterpretable high-uncertainty territory.
+The gradient-driven mode (Component 730) computes the descent direction of a learned Stage-2 compliance scorer's per-axis score in embedding space using **central-differences finite-differencing**, steps a candidate embedding along that direction with **dual stopping criteria** (violation-threshold crossing and GP posterior uncertainty cap), and feeds the final embedding into the embedding-space verification mechanism of Component 700. The use of finite-differencing avoids requiring backprop access to the regression head and works uniformly across head families. The dual stopping criterion ensures that gradient extrapolation halts at the boundary of the learned model's confident region rather than continuing into uninterpretable high-uncertainty territory.
 
 ### 6.6 Four orthogonal monitoring signals on a shared learned geometry
 
